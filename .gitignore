@@ -6,3 +6,5 @@ test_out/
 test_*.py
 probe_*.py
 *.log
+commit_msg.txt
+release_notes.md

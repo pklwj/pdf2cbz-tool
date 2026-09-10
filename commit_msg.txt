@@ -1,1 +1,0 @@
-v1.1.0: multiprocessing parallel conversion + worker count option
