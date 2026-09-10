@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """PDF 转 CBZ 漫画打包工具
-功能：选择 PDF/文件夹 -> 无损提取图片（原格式、xref+MD5 去重）-> 打包为 CBZ
+功能：选择 PDF/文件夹 -> 无损提取图片（原格式、xref+MD5 去重）-> 多进程并行打包为 CBZ
      附带：批量重命名 CBZ（统一为“名称 v卷号”格式）
+说明：PyMuPDF 官方不支持多线程，并行采用多进程（每个进程独立打开 PDF）。
 """
 import os
 import re
@@ -10,6 +11,7 @@ import hashlib
 import zipfile
 import shutil
 import threading
+import multiprocessing
 import traceback
 
 import tkinter as tk
@@ -29,23 +31,20 @@ def scan_pdfs(folder, recursive=False):
     return sorted(glob.glob(os.path.join(folder, "*.pdf")))
 
 
-def convert_pdf_to_cbz(pdf_path, out_dir, keep_images=False, overwrite=False, log=None):
-    """转换单个 PDF。返回 (是否成功, 消息)"""
-    def emit(s):
-        if log:
-            log(s)
-
+def convert_pdf_to_cbz(args):
+    """转换单个 PDF（多进程 worker）。参数打包为元组以便 Pool 分发。
+    返回 (任务序号, 是否成功, 消息)。不依赖 GUI，可被 pickle。"""
+    idx, pdf_path, out_dir, keep_images, overwrite = args
     base = os.path.basename(pdf_path)
     vol = os.path.splitext(base)[0]
     cbz = os.path.join(out_dir, vol + ".cbz")
 
     if os.path.exists(cbz) and not overwrite:
-        return False, f"跳过：{vol}.cbz 已存在（勾选“覆盖”可重做）"
+        return idx, False, f"跳过：{vol}.cbz 已存在（勾选“覆盖”可重做）"
 
     work = os.path.join(out_dir, f".tmp_{vol}_{os.getpid()}")
     os.makedirs(work, exist_ok=True)
     try:
-        emit(f"处理中：{base}")
         doc = pymupdf.open(pdf_path)
         seen_xref, seen_hash, saved = set(), set(), []
         for page in doc:
@@ -67,19 +66,19 @@ def convert_pdf_to_cbz(pdf_path, out_dir, keep_images=False, overwrite=False, lo
         doc.close()
 
         if not saved:
-            return False, f"失败：{base} 未提取到任何图片"
+            return idx, False, f"失败：{base} 未提取到任何图片"
 
         with zipfile.ZipFile(cbz, "w", zipfile.ZIP_STORED) as z:
             for fn in saved:
                 z.write(os.path.join(work, fn), arcname=fn)
 
-        msg = f"完成：{vol}.cbz（{len(saved)} 张唯一图片，{os.path.getsize(cbz) / 1024 / 1024:.1f} MB）"
-        shutil.rmtree(work, ignore_errors=True)
-        return True, msg
+        size_mb = os.path.getsize(cbz) / 1024 / 1024
+        if not keep_images:
+            shutil.rmtree(work, ignore_errors=True)
+        return idx, True, f"完成：{vol}.cbz（{len(saved)} 张唯一图片，{size_mb:.1f} MB）"
     except Exception as e:
         shutil.rmtree(work, ignore_errors=True)
-        traceback.print_exc()
-        return False, f"失败：{base}：{e}"
+        return idx, False, f"失败：{base}：{e}"
 
 
 # ---------- 批量重命名 ----------
@@ -126,14 +125,12 @@ class RenameDialog(tk.Toplevel):
         self.prefix_var = tk.StringVar(value="")
         self.mode_var = tk.StringVar(value="auto")
 
-        # 目录
         row1 = ttk.Frame(self)
         row1.pack(fill="x", padx=8, pady=4)
         ttk.Label(row1, text="目录：").pack(side="left")
         ttk.Entry(row1, textvariable=self.dir_var).pack(side="left", fill="x", expand=True, padx=6)
         ttk.Button(row1, text="浏览…", command=self._browse).pack(side="left")
 
-        # 前缀 + 模式
         row2 = ttk.Frame(self)
         row2.pack(fill="x", padx=8, pady=4)
         ttk.Label(row2, text="名称前缀：").pack(side="left")
@@ -144,7 +141,6 @@ class RenameDialog(tk.Toplevel):
                           values=["自动提取", "按顺序编号"])
         cb.pack(side="left", padx=6)
 
-        # 预览
         cols = ("old", "new")
         self.tree = ttk.Treeview(self, columns=cols, show="headings", height=10)
         self.tree.heading("old", text="原文件名")
@@ -161,7 +157,6 @@ class RenameDialog(tk.Toplevel):
         ttk.Button(row3, text="执行重命名", command=self._do_rename).pack(side="right")
         ttk.Button(row3, text="刷新", command=self._refresh).pack(side="right", padx=6)
 
-        # 绑定变化即刷新预览
         self.prefix_var.trace_add("write", lambda *a: self._refresh())
         self.mode_var.trace_add("write", lambda *a: self._refresh())
         self.dir_var.trace_add("write", lambda *a: self._refresh())
@@ -199,7 +194,6 @@ class RenameDialog(tk.Toplevel):
             return
         plan = plan_renames(folder, self.prefix_var.get().strip(),
                             "auto" if self.mode_var.get() == "自动提取" else "seq")
-        # 冲突检查
         targets = [os.path.join(folder, new) for _, new in plan]
         conflicts = [new for (old, new), t in zip(plan, targets)
                      if os.path.exists(t) and os.path.basename(t) != old]
@@ -229,22 +223,23 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("PDF 转 CBZ 漫画打包工具")
-        self.geometry("760x600")
-        self.minsize(680, 500)
+        self.geometry("780x620")
+        self.minsize(680, 520)
 
         self.files = []          # [(path, status)]
         self.out_dir = tk.StringVar(value="")
         self.keep_images = tk.BooleanVar(value=False)
         self.overwrite = tk.BooleanVar(value=False)
         self.recursive = tk.BooleanVar(value=False)
+        self.workers = tk.StringVar(value="4")
         self.running = False
+        self._done_count = 0
 
         self._build_ui()
 
     def _build_ui(self):
         pad = {"padx": 8, "pady": 4}
 
-        # --- 文件区 ---
         frm_top = ttk.LabelFrame(self, text="1. 选择 PDF 文件（可多选 / 添加整个文件夹）")
         frm_top.pack(fill="both", expand=True, **pad)
 
@@ -266,7 +261,6 @@ class App(tk.Tk):
         self.tree.column("status", width=120)
         self.tree.pack(fill="both", expand=True, padx=8, pady=4)
 
-        # --- 选项区 ---
         frm_opt = ttk.LabelFrame(self, text="2. 选项")
         frm_opt.pack(fill="x", **pad)
 
@@ -282,8 +276,10 @@ class App(tk.Tk):
                         variable=self.keep_images).pack(side="left", padx=(0, 16))
         ttk.Checkbutton(row2, text="覆盖已存在的 CBZ（默认跳过）",
                         variable=self.overwrite).pack(side="left")
+        ttk.Label(row2, text="并行任务数：").pack(side="left", padx=(16, 4))
+        ttk.Combobox(row2, textvariable=self.workers, state="readonly", width=4,
+                     values=["1", "2", "4", "8"]).pack(side="left")
 
-        # --- 执行区 ---
         frm_run = ttk.LabelFrame(self, text="3. 开始")
         frm_run.pack(fill="x", **pad)
 
@@ -352,12 +348,20 @@ class App(tk.Tk):
         self.log.see("end")
         self.log.configure(state="disabled")
 
-    # ---------- 转换 ----------
+    # ---------- 转换（多进程并行） ----------
     def _set_status(self, i, status):
-        item = self.tree.get_children()[i]
-        vals = list(self.tree.item(item, "values"))
-        vals[2] = status
-        self.tree.item(item, values=vals)
+        children = self.tree.get_children()
+        if 0 <= i < len(children):
+            item = children[i]
+            vals = list(self.tree.item(item, "values"))
+            vals[2] = status
+            self.tree.item(item, values=vals)
+
+    def _on_one_done(self, idx, ok, msg):
+        self.log_line(msg)
+        self._set_status(idx, "完成" if ok else "失败/跳过")
+        self._done_count += 1
+        self.progress.configure(value=self._done_count)
 
     def start(self):
         if self.running:
@@ -374,24 +378,22 @@ class App(tk.Tk):
             messagebox.showwarning("提示", "输出目录不存在")
             return
 
+        keep = self.keep_images.get()
+        ove = self.overwrite.get()
+        n_workers = int(self.workers.get())
+        params = [(i, path, out_dir, keep, ove) for i, path in enumerate(todo)]
+
         self.running = True
+        self._done_count = 0
         self.btn_start.config(state="disabled")
         self.progress.configure(maximum=len(todo), value=0)
-        self.log_line(f"== 开始转换 {len(todo)} 个文件，输出到：{out_dir} ==")
+        self.log_line(f"== 开始转换 {len(todo)} 个文件（并行 {n_workers}），输出到：{out_dir} ==")
 
         def worker():
             try:
-                for idx, path in enumerate(todo):
-                    keep = self.keep_images.get()
-                    ove = self.overwrite.get()
-                    ok, msg = convert_pdf_to_cbz(path, out_dir, keep, ove,
-                                                 log=lambda s: self.after(0, self.log_line, s))
-                    self.after(0, self.log_line, msg)
-                    if ok:
-                        self.after(0, lambda i=idx: self._set_status(i, "完成"))
-                    else:
-                        self.after(0, lambda i=idx: self._set_status(i, "失败/跳过"))
-                    self.after(0, lambda i=idx: self.progress.configure(value=i + 1))
+                with multiprocessing.Pool(n_workers) as pool:
+                    for idx, ok, msg in pool.imap_unordered(convert_pdf_to_cbz, params):
+                        self.after(0, self._on_one_done, idx, ok, msg)
                 self.after(0, self.log_line, "== 全部处理结束 ==")
             except Exception as e:
                 self.after(0, self.log_line, f"异常：{e}")
@@ -406,4 +408,5 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()   # PyInstaller --windowed 下多进程必需
     App().mainloop()
