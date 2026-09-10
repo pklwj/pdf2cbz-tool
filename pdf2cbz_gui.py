@@ -97,9 +97,14 @@ def extract_volume(filename):
     return None
 
 
+def _nat_key(name):
+    """自然排序：1.cbz, 2.cbz, ..., 10.cbz（数字按数值，而非字典序）"""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
+
+
 def plan_renames(folder, prefix, mode="auto"):
     """计算重命名计划。返回 [(原名, 新名)]，不执行。"""
-    cbzs = sorted(glob.glob(os.path.join(folder, "*.cbz")))
+    cbzs = sorted(glob.glob(os.path.join(folder, "*.cbz")), key=_nat_key)
     plan = []
     for i, p in enumerate(cbzs, start=1):
         old = os.path.basename(p)
@@ -123,7 +128,7 @@ class RenameDialog(tk.Toplevel):
 
         self.dir_var = tk.StringVar(value=default_dir)
         self.prefix_var = tk.StringVar(value="")
-        self.mode_var = tk.StringVar(value="auto")
+        self.mode_var = tk.StringVar(value="自动提取")
 
         row1 = ttk.Frame(self)
         row1.pack(fill="x", padx=8, pady=4)
@@ -231,7 +236,7 @@ class App(tk.Tk):
         self.keep_images = tk.BooleanVar(value=False)
         self.overwrite = tk.BooleanVar(value=False)
         self.recursive = tk.BooleanVar(value=False)
-        self.workers = tk.StringVar(value="4")
+        self.workers = tk.StringVar(value="6")
         self.running = False
         self._done_count = 0
 
@@ -278,7 +283,7 @@ class App(tk.Tk):
                         variable=self.overwrite).pack(side="left")
         ttk.Label(row2, text="并行任务数：").pack(side="left", padx=(16, 4))
         ttk.Combobox(row2, textvariable=self.workers, state="readonly", width=4,
-                     values=["1", "2", "4", "8"]).pack(side="left")
+                     values=["1", "2", "4", "6", "8"]).pack(side="left")
 
         frm_run = ttk.LabelFrame(self, text="3. 开始")
         frm_run.pack(fill="x", **pad)
