@@ -14,6 +14,7 @@ import tempfile
 import threading
 import multiprocessing
 import traceback
+import time
 from collections import Counter, namedtuple
 
 import tkinter as tk
@@ -406,6 +407,9 @@ class App(tk.Tk):
         self._done_count = 0
         self._pool = None
         self._cancelled = False
+        self._run_started = 0.0
+        self._run_ok = 0
+        self._run_fail = 0
         # 保护跨线程共享字段（_pool / _cancelled），主线程与 worker 线程都会读写
         self._state_lock = threading.Lock()
 
@@ -546,11 +550,30 @@ class App(tk.Tk):
         RenameDialog(self, self.out_dir.get().strip() or os.getcwd())
 
     # ---------- 日志 ----------
-    def log_line(self, s):
+    def log_line(self, s, to_file=True):
+        """写入 GUI 日志框；同时按需追加到输出目录的 pdf2cbz.log。
+        写文件失败绝不影响主流程（例如目录只读、被占用）。"""
         self.log.configure(state="normal")
         self.log.insert("end", s + "\n")
         self.log.see("end")
         self.log.configure(state="disabled")
+        if to_file:
+            self._log_to_file(s)
+
+    def _log_to_file(self, s):
+        """追加到 <输出目录>/pdf2cbz.log。多行内容按行加时间戳；失败静默。"""
+        out_dir = self.out_dir.get().strip()
+        if not out_dir or not os.path.isdir(out_dir):
+            return
+        try:
+            path = os.path.join(out_dir, "pdf2cbz.log")
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            with open(path, "a", encoding="utf-8") as f:
+                for i, line in enumerate(str(s).splitlines() or [""]):
+                    # 首行带时间戳，后续行缩进对齐（traceback 等）
+                    f.write(f"[{ts}] {line}\n" if i == 0 else f"           {line}\n")
+        except OSError:
+            pass          # 日志写不出不是致命错误，忽略即可
 
     # ---------- 转换（多进程并行） ----------
     def _set_status_by_path(self, path, status):
@@ -572,6 +595,10 @@ class App(tk.Tk):
 
     def _on_one_done(self, path, ok, msg):
         self.log_line(msg)
+        if ok:
+            self._run_ok += 1
+        else:
+            self._run_fail += 1
         self._set_status_by_path(path, "完成" if ok else "失败/跳过")
         self._done_count += 1
         self.progress.configure(value=self._done_count)
@@ -617,7 +644,12 @@ class App(tk.Tk):
         self.btn_start.config(state="disabled")
         self.btn_cancel.config(state="normal")
         self.progress.configure(maximum=len(todo), value=0)
-        self.log_line(f"== 开始转换 {len(todo)} 个文件（并行 {n_workers}），输出到：{out_dir} ==")
+        self._run_started = time.time()
+        self._run_ok = 0
+        self._run_fail = 0
+        self.log_line(f"===== 运行开始 | 输出目录：{out_dir} =====")
+        self.log_line(f"== 开始转换 {len(todo)} 个文件（并行 {n_workers}），"
+                      f"保留中间图片：{'是' if keep else '否'}，覆盖：{'是' if ove else '否'} ==")
 
         def worker():
             pool = None
@@ -651,12 +683,23 @@ class App(tk.Tk):
                 with self._state_lock:
                     self._pool = None
                     cancelled = self._cancelled
-                self.after(0, self.log_line,
-                           "== 已停止（未完成的任务被中止）==" if cancelled
-                           else "== 全部处理结束 ==")
+                self.after(0, self._on_run_end, cancelled)
                 self.after(0, self._finish)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _on_run_end(self, cancelled):
+        """统一输出运行结束摘要（GUI + 日志文件）。"""
+        elapsed = time.time() - self._run_started if self._run_started else 0
+        total = self._run_ok + self._run_fail
+        head = "已停止" if cancelled else "运行结束"
+        self.log_line(f"===== {head} | 共 {total} 个：成功 {self._run_ok}，"
+                      f"失败/跳过 {self._run_fail}，用时 {elapsed:.1f}s =====")
+        if cancelled:
+            self.log_line("（未完成的任务被中止；失败项可在下次运行时重试）")
+        if self._run_fail:
+            # 只提示到 GUI，不写进日志文件（否则日志里自己指自己，多余）
+            self.log_line("（失败原因见本目录下的 pdf2cbz.log）", to_file=False)
 
     def cancel(self):
         with self._state_lock:
