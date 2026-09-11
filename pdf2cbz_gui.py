@@ -14,6 +14,7 @@ import tempfile
 import threading
 import multiprocessing
 import traceback
+from collections import Counter, namedtuple
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -21,10 +22,8 @@ from tkinter import ttk, filedialog, messagebox
 import pymupdf
 
 
-def _safe_stem(name):
-    """把卷名清洗成可安全用作目录/文件名的字符串（去掉 Windows 非法字符）。"""
-    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
-    return stem or "untitled"
+# 转换任务参数：用具名元组替代裸元组，避免位置传参错位，且可被 pickle。
+ConvertJob = namedtuple("ConvertJob", "key pdf_path out_dir keep_images overwrite")
 
 
 def _cleanup_stale_tmp(out_dir):
@@ -38,34 +37,41 @@ def _cleanup_stale_tmp(out_dir):
 
 
 def scan_pdfs(folder, recursive=False):
+    """扫描 PDF。递归与非递归行为一致：大小写不敏感（.pdf / .PDF 都收）。"""
+    result = []
     if recursive:
-        result = []
         for root, _, files in os.walk(folder):
             for f in files:
                 if f.lower().endswith(".pdf"):
                     result.append(os.path.join(root, f))
-        return sorted(result)
-    return sorted(glob.glob(os.path.join(folder, "*.pdf")))
+    else:
+        for entry in os.scandir(folder):
+            if entry.is_file() and entry.name.lower().endswith(".pdf"):
+                result.append(entry.path)
+    return sorted(result)
 
 
-def convert_pdf_to_cbz(args):
-    """转换单个 PDF（多进程 worker）。参数打包为元组以便 Pool 分发。
-    返回 (任务键, 是否成功, 消息)。任务键用于回写状态，避免顺序错位。
-    不依赖 GUI，可被 pickle。"""
-    idx, pdf_path, out_dir, keep_images, overwrite = args
+def convert_pdf_to_cbz(job):
+    """转换单个 PDF（多进程 worker）。入参为 ConvertJob（可 pickle）。
+    返回 (key, 是否成功, 消息)。key 用于回写状态，避免顺序错位。"""
+    key = job.key
+    pdf_path = job.pdf_path
+    out_dir = job.out_dir
+    keep_images = job.keep_images
+    overwrite = job.overwrite
     base = os.path.basename(pdf_path)
     vol = os.path.splitext(base)[0]
     cbz = os.path.join(out_dir, vol + ".cbz")
 
     if os.path.exists(cbz) and not overwrite:
-        return idx, False, f"跳过：{vol}.cbz 已存在（勾选“覆盖”可重做）"
+        return key, False, f"跳过：{vol}.cbz 已存在（勾选“覆盖”可重做）"
 
     # 中间文件放系统临时目录，避免污染输出目录；进程崩溃也不留垃圾在 out_dir。
     work = tempfile.mkdtemp(prefix=f"pdf2cbz_{os.getpid()}_")
     try:
-        doc = pymupdf.open(pdf_path)
-        try:
-            seen_xref, seen_hash, saved = set(), set(), []
+        saved = []
+        with pymupdf.open(pdf_path) as doc:
+            seen_xref, seen_hash = set(), set()
             for page in doc:
                 for img in page.get_images(full=True):
                     xref = img[0]
@@ -82,11 +88,9 @@ def convert_pdf_to_cbz(args):
                     with open(os.path.join(work, fname), "wb") as f:
                         f.write(info["image"])
                     saved.append(fname)
-        finally:
-            doc.close()
 
         if not saved:
-            return idx, False, f"失败：{base} 未提取到任何图片"
+            return key, False, f"失败：{base} 未提取到任何图片"
 
         # 先写临时文件再原子替换，避免中途失败留下半截 CBZ。
         tmp_cbz = cbz + ".part"
@@ -105,10 +109,10 @@ def convert_pdf_to_cbz(args):
         size_mb = os.path.getsize(cbz) / 1024 / 1024
         if not keep_images:
             shutil.rmtree(work, ignore_errors=True)
-        return idx, True, f"完成：{vol}.cbz（{len(saved)} 张唯一图片，{size_mb:.1f} MB）"
+        return key, True, f"完成：{vol}.cbz（{len(saved)} 张唯一图片，{size_mb:.1f} MB）"
     except Exception as e:
         shutil.rmtree(work, ignore_errors=True)
-        return idx, False, f"失败：{base}：{e}"
+        return key, False, f"失败：{base}：{e}\n{traceback.format_exc()}"
 
 
 # ---------- 批量重命名 ----------
@@ -162,7 +166,6 @@ def plan_renames(folder, prefix, mode="auto"):
 
 def find_conflicts(plan, folder):
     """返回冲突列表：目标名在两个源之间重复，或目标名已被非自身文件占用。"""
-    from collections import Counter
     target_counts = Counter(new for _, new in plan)
     conflicts = []
     for old, new in plan:
@@ -386,6 +389,8 @@ class App(tk.Tk):
         self._done_count = 0
         self._pool = None
         self._cancelled = False
+        # 保护跨线程共享字段（_pool / _cancelled），主线程与 worker 线程都会读写
+        self._state_lock = threading.Lock()
 
         self._build_ui()
 
@@ -448,6 +453,24 @@ class App(tk.Tk):
         self.log = tk.Text(frm_run, height=8, state="disabled")
         self.log.pack(fill="both", expand=True, padx=8, pady=4)
 
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self):
+        """关窗时若仍在转换，提示并清理子进程，避免孤儿进程。"""
+        if self.running:
+            if not messagebox.askyesno("确认退出", "转换仍在进行中，确定退出吗？\n未完成的任务会被中止。"):
+                return
+            with self._state_lock:
+                self._cancelled = True
+                pool = self._pool
+            if pool is not None:
+                try:
+                    pool.terminate()
+                    pool.join()
+                except Exception:
+                    pass
+        self.destroy()
+
     # ---------- 文件列表 ----------
     def add_files(self):
         paths = filedialog.askopenfilenames(
@@ -478,10 +501,20 @@ class App(tk.Tk):
         self.log_line(f"已添加 {added} 个 PDF（累计 {len(self.files)} 个）")
 
     def remove_selected(self):
-        for item in self.tree.selection():
-            i = self.tree.index(item)
+        """按路径精确移除选中项。不用 tree.index 反查（多选删除时索引会前移导致删错）。"""
+        sel_items = list(self.tree.selection())
+        if not sel_items:
+            return
+        # 先取出要删的路径集合，再统一过滤，避免边删边算索引
+        paths_to_remove = set()
+        for item in sel_items:
+            vals = self.tree.item(item, "values")
+            if vals and len(vals) > 1:
+                paths_to_remove.add(os.path.normpath(vals[1]))
             self.tree.delete(item)
-            self.files.pop(i)
+        self.files = [f for f in self.files
+                      if os.path.normpath(f[0]) not in paths_to_remove]
+        self.log_line(f"已移除 {len(paths_to_remove)} 个（剩余 {len(self.files)} 个）")
 
     def clear_files(self):
         self.tree.delete(*self.tree.get_children())
@@ -556,61 +589,80 @@ class App(tk.Tk):
             n_workers = 4
 
         # 任务键用文件路径（唯一），而非序号 —— 序号在过滤后会错位。
-        params = [(p, p, out_dir, keep, ove) for p in todo]
+        params = [ConvertJob(key=p, pdf_path=p, out_dir=out_dir,
+                             keep_images=keep, overwrite=ove) for p in todo]
 
         self.running = True
         self._done_count = 0
-        self._pool = None
-        self._cancelled = False
+        with self._state_lock:
+            self._pool = None
+            self._cancelled = False
         self.btn_start.config(state="disabled")
         self.btn_cancel.config(state="normal")
         self.progress.configure(maximum=len(todo), value=0)
         self.log_line(f"== 开始转换 {len(todo)} 个文件（并行 {n_workers}），输出到：{out_dir} ==")
 
         def worker():
+            pool = None
             try:
                 # maxtasksperchild 限制单进程内存累积，避免大 PDF 长跑内存泄漏
                 pool = multiprocessing.Pool(n_workers, maxtasksperchild=8)
-                self._pool = pool
-                try:
-                    for key, ok, msg in pool.imap_unordered(convert_pdf_to_cbz, params):
-                        if self._cancelled:
-                            break
-                        self.after(0, self._on_one_done, key, ok, msg)
-                finally:
-                    pool.terminate()
-                    pool.join()
-                    self._pool = None
-                if self._cancelled:
-                    self.after(0, self.log_line, "== 已停止（未完成的任务被中止）==")
-                else:
-                    self.after(0, self.log_line, "== 全部处理结束 ==")
-            except Exception as e:
-                self.after(0, self.log_line, f"异常：{e}")
+                with self._state_lock:
+                    if self._cancelled:
+                        # 构建期间用户已请求停止：立刻收尾，不再提交任务
+                        pool.terminate()
+                        pool.join()
+                        return
+                    self._pool = pool
+                sent = 0
+                for key, ok, msg in pool.imap_unordered(convert_pdf_to_cbz, params):
+                    sent += 1
+                    with self._state_lock:
+                        cancelled = self._cancelled
+                    if cancelled:
+                        break
+                    self.after(0, self._on_one_done, key, ok, msg)
+            except Exception:
+                self.after(0, self.log_line, "异常：\n" + traceback.format_exc())
             finally:
+                if pool is not None:
+                    try:
+                        pool.terminate()
+                        pool.join()
+                    except Exception:
+                        pass
+                with self._state_lock:
+                    self._pool = None
+                    cancelled = self._cancelled
+                self.after(0, self.log_line,
+                           "== 已停止（未完成的任务被中止）==" if cancelled
+                           else "== 全部处理结束 ==")
                 self.after(0, self._finish)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def cancel(self):
-        if not self.running:
-            return
+        with self._state_lock:
+            if not self.running or self._cancelled:
+                return
         if not messagebox.askyesno("确认停止", "确定要停止转换吗？\n正在处理的文件会被中止，已完成的不受影响。"):
             return
-        self._cancelled = True
+        with self._state_lock:
+            self._cancelled = True
+            pool = self._pool
         self.btn_cancel.config(state="disabled")
         self.log_line("== 收到停止请求，正在中止… ==")
-        pool = self._pool
         if pool is not None:
             try:
-                pool.terminate()
+                pool.terminate()          # 已加锁取引用；terminate 本身幂等
             except Exception:
                 pass
 
     def _finish(self):
         self.running = False
-        self._cancelled = False
-        self._pool = None
+        with self._state_lock:
+            self._cancelled = False
+            self._pool = None
         self.btn_start.config(state="normal")
         self.btn_cancel.config(state="disabled")
 
