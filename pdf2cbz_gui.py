@@ -129,6 +129,7 @@ class RenameDialog(tk.Toplevel):
         self.dir_var = tk.StringVar(value=default_dir)
         self.prefix_var = tk.StringVar(value="")
         self.mode_var = tk.StringVar(value="自动提取")
+        self.skipped = set()  # 被取消（跳过）重命名的原文件名集合
 
         row1 = ttk.Frame(self)
         row1.pack(fill="x", padx=8, pady=4)
@@ -146,13 +147,17 @@ class RenameDialog(tk.Toplevel):
                           values=["自动提取", "按顺序编号"])
         cb.pack(side="left", padx=6)
 
-        cols = ("old", "new")
+        cols = ("status", "old", "new")
         self.tree = ttk.Treeview(self, columns=cols, show="headings", height=10)
+        self.tree.heading("status", text="状态")
         self.tree.heading("old", text="原文件名")
         self.tree.heading("new", text="新文件名")
-        self.tree.column("old", width=280)
-        self.tree.column("new", width=280)
+        self.tree.column("status", width=60, anchor="center")
+        self.tree.column("old", width=245)
+        self.tree.column("new", width=245)
         self.tree.pack(fill="both", expand=True, padx=8, pady=4)
+        self.tree.tag_configure("skip", foreground="gray")
+        self.tree.bind("<Double-Button-1>", self._toggle_skip)
 
         self.lbl = ttk.Label(self, text="")
         self.lbl.pack(fill="x", padx=8)
@@ -161,6 +166,8 @@ class RenameDialog(tk.Toplevel):
         row3.pack(fill="x", padx=8, pady=6)
         ttk.Button(row3, text="执行重命名", command=self._do_rename).pack(side="right")
         ttk.Button(row3, text="刷新", command=self._refresh).pack(side="right", padx=6)
+        ttk.Button(row3, text="恢复选中", command=self._restore_selected).pack(side="right", padx=6)
+        ttk.Button(row3, text="跳过选中", command=self._skip_selected).pack(side="right", padx=6)
 
         self.prefix_var.trace_add("write", lambda *a: self._refresh())
         self.mode_var.trace_add("write", lambda *a: self._refresh())
@@ -188,9 +195,59 @@ class RenameDialog(tk.Toplevel):
         if not plan:
             self.lbl.config(text="该目录下没有 .cbz 文件")
             return
+        existing = {old for old, _ in plan}
+        self.skipped &= existing  # 清理已不在列表中的跳过项
         for old, new in plan:
-            self.tree.insert("", "end", values=(old, new))
-        self.lbl.config(text=f"共 {len(plan)} 个文件，预览如上；请确认无误后执行")
+            if old in self.skipped:
+                self.tree.insert("", "end", values=("跳过", old, new), tags=("skip",))
+            else:
+                self.tree.insert("", "end", values=("执行", old, new))
+        if self.skipped:
+            self.lbl.config(text=f"共 {len(plan)} 个文件，其中 {len(self.skipped)} 个已取消（跳过），执行时不会被改名")
+        else:
+            self.lbl.config(text=f"共 {len(plan)} 个文件；双击行或选中后点「跳过选中」可取消单个文件")
+
+    # ---- 取消 / 恢复单个文件 ----
+    def _skip_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        for item in sel:
+            vals = self.tree.item(item, "values")
+            self.skipped.add(vals[1])
+            self.tree.item(item, values=("跳过", vals[1], vals[2]), tags=("skip",))
+        self._update_lbl()
+
+    def _restore_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        for item in sel:
+            vals = self.tree.item(item, "values")
+            self.skipped.discard(vals[1])
+            self.tree.item(item, values=("执行", vals[1], vals[2]), tags=())
+        self._update_lbl()
+
+    def _toggle_skip(self, _event=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        for item in sel:
+            vals = self.tree.item(item, "values")
+            if vals[1] in self.skipped:
+                self.skipped.discard(vals[1])
+                self.tree.item(item, values=("执行", vals[1], vals[2]), tags=())
+            else:
+                self.skipped.add(vals[1])
+                self.tree.item(item, values=("跳过", vals[1], vals[2]), tags=("skip",))
+        self._update_lbl()
+
+    def _update_lbl(self):
+        total = len(self.tree.get_children())
+        if self.skipped:
+            self.lbl.config(text=f"共 {total} 个文件，其中 {len(self.skipped)} 个已取消（跳过），执行时不会被改名")
+        else:
+            self.lbl.config(text=f"共 {total} 个文件；双击行或选中后点「跳过选中」可取消单个文件")
 
     def _do_rename(self):
         folder = self.dir_var.get().strip()
@@ -199,6 +256,7 @@ class RenameDialog(tk.Toplevel):
             return
         plan = plan_renames(folder, self.prefix_var.get().strip(),
                             "auto" if self.mode_var.get() == "自动提取" else "seq")
+        plan = [(old, new) for old, new in plan if old not in self.skipped]  # 过滤已取消的文件
         targets = [os.path.join(folder, new) for _, new in plan]
         conflicts = [new for (old, new), t in zip(plan, targets)
                      if os.path.exists(t) and os.path.basename(t) != old]
@@ -206,7 +264,10 @@ class RenameDialog(tk.Toplevel):
             messagebox.showerror("冲突", "以下新文件名已存在，未执行：\n" + "\n".join(conflicts))
             return
         if not plan:
-            messagebox.showinfo("提示", "没有可重命名的文件")
+            if self.skipped:
+                messagebox.showinfo("提示", "所有文件都已取消（跳过），没有可重命名的文件")
+            else:
+                messagebox.showinfo("提示", "没有可重命名的文件")
             return
         if not messagebox.askyesno("确认", f"将重命名 {len(plan)} 个文件，继续？"):
             return
@@ -219,7 +280,10 @@ class RenameDialog(tk.Toplevel):
                 ok += 1
             except OSError as e:
                 messagebox.showerror("失败", f"{old}：{e}")
-        messagebox.showinfo("完成", f"已重命名 {ok}/{len(plan)} 个文件")
+        msg = f"已重命名 {ok}/{len(plan)} 个文件"
+        if self.skipped:
+            msg += f"（取消 {len(self.skipped)} 个）"
+        messagebox.showinfo("完成", msg)
         self._refresh()
 
 
