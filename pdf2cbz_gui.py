@@ -10,6 +10,7 @@ import glob
 import hashlib
 import zipfile
 import shutil
+import tempfile
 import threading
 import multiprocessing
 import traceback
@@ -18,6 +19,22 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import pymupdf
+
+
+def _safe_stem(name):
+    """把卷名清洗成可安全用作目录/文件名的字符串（去掉 Windows 非法字符）。"""
+    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
+    return stem or "untitled"
+
+
+def _cleanup_stale_tmp(out_dir):
+    """清理输出目录里上次崩溃残留的 .tmp_* 目录（在开始转换前调用）。"""
+    try:
+        for d in glob.glob(os.path.join(out_dir, ".tmp_*")):
+            if os.path.isdir(d):
+                shutil.rmtree(d, ignore_errors=True)
+    except Exception:
+        pass
 
 
 def scan_pdfs(folder, recursive=False):
@@ -33,7 +50,8 @@ def scan_pdfs(folder, recursive=False):
 
 def convert_pdf_to_cbz(args):
     """转换单个 PDF（多进程 worker）。参数打包为元组以便 Pool 分发。
-    返回 (任务序号, 是否成功, 消息)。不依赖 GUI，可被 pickle。"""
+    返回 (任务键, 是否成功, 消息)。任务键用于回写状态，避免顺序错位。
+    不依赖 GUI，可被 pickle。"""
     idx, pdf_path, out_dir, keep_images, overwrite = args
     base = os.path.basename(pdf_path)
     vol = os.path.splitext(base)[0]
@@ -42,35 +60,47 @@ def convert_pdf_to_cbz(args):
     if os.path.exists(cbz) and not overwrite:
         return idx, False, f"跳过：{vol}.cbz 已存在（勾选“覆盖”可重做）"
 
-    work = os.path.join(out_dir, f".tmp_{vol}_{os.getpid()}")
-    os.makedirs(work, exist_ok=True)
+    # 中间文件放系统临时目录，避免污染输出目录；进程崩溃也不留垃圾在 out_dir。
+    work = tempfile.mkdtemp(prefix=f"pdf2cbz_{os.getpid()}_")
     try:
         doc = pymupdf.open(pdf_path)
-        seen_xref, seen_hash, saved = set(), set(), []
-        for page in doc:
-            for img in page.get_images(full=True):
-                xref = img[0]
-                if xref in seen_xref:
-                    continue
-                seen_xref.add(xref)
-                info = doc.extract_image(xref)          # 原始字节，无损、保原格式
-                d = hashlib.md5(info["image"]).hexdigest()
-                if d in seen_hash:
-                    continue
-                seen_hash.add(d)
-                n = len(saved) + 1
-                fname = f"img_{n:03d}.{info['ext']}"
-                with open(os.path.join(work, fname), "wb") as f:
-                    f.write(info["image"])
-                saved.append(fname)
-        doc.close()
+        try:
+            seen_xref, seen_hash, saved = set(), set(), []
+            for page in doc:
+                for img in page.get_images(full=True):
+                    xref = img[0]
+                    if xref in seen_xref:
+                        continue
+                    seen_xref.add(xref)
+                    info = doc.extract_image(xref)          # 原始字节，无损、保原格式
+                    d = hashlib.md5(info["image"]).hexdigest()
+                    if d in seen_hash:
+                        continue
+                    seen_hash.add(d)
+                    n = len(saved) + 1
+                    fname = f"img_{n:03d}.{info['ext']}"
+                    with open(os.path.join(work, fname), "wb") as f:
+                        f.write(info["image"])
+                    saved.append(fname)
+        finally:
+            doc.close()
 
         if not saved:
             return idx, False, f"失败：{base} 未提取到任何图片"
 
-        with zipfile.ZipFile(cbz, "w", zipfile.ZIP_STORED) as z:
-            for fn in saved:
-                z.write(os.path.join(work, fn), arcname=fn)
+        # 先写临时文件再原子替换，避免中途失败留下半截 CBZ。
+        tmp_cbz = cbz + ".part"
+        try:
+            with zipfile.ZipFile(tmp_cbz, "w", zipfile.ZIP_STORED) as z:
+                for fn in saved:
+                    z.write(os.path.join(work, fn), arcname=fn)
+            os.replace(tmp_cbz, cbz)          # 原子；Windows/POSIX 均可覆盖
+        finally:
+            if os.path.exists(tmp_cbz):
+                try:
+                    os.remove(tmp_cbz)
+                except OSError:
+                    pass
 
         size_mb = os.path.getsize(cbz) / 1024 / 1024
         if not keep_images:
@@ -82,18 +112,29 @@ def convert_pdf_to_cbz(args):
 
 
 # ---------- 批量重命名 ----------
-_RE_VOL = re.compile(r"(?:[Vv]ol\.?|第)\s*(\d{1,4})")
-_RE_NUM = re.compile(r"(\d{1,4})")
+# 卷号识别：只认「明确的卷标记」，不再瞎抓任意数字（避免把年份/页数/章节号当卷号）。
+# 支持：Vol.12 / Vol 12 / v12 / V12 / 第12卷 / 第12巻 / 12巻 / #12
+_RE_VOL_PATTERNS = [
+    re.compile(r"[Vv]ol\.?\s*(\d{1,4})"),
+    re.compile(r"[Vv](\d{1,4})(?!\d)"),
+    re.compile(r"第\s*(\d{1,4})\s*[卷巻册]"),
+    re.compile(r"(\d{1,4})\s*[巻册]"),
+    re.compile(r"#\s*(\d{1,4})"),
+]
 
 
 def extract_volume(filename):
-    """从文件名提取卷号（int 或 None）。优先 Vol.xx / 第xx卷，再取第一个数字。"""
-    m = _RE_VOL.search(filename)
-    if m:
-        return int(m.group(1))
-    m = _RE_NUM.search(filename)
-    if m:
-        return int(m.group(1))
+    """从文件名提取卷号。只认明确卷标记；无标记返回 None（由调用方退化为顺序编号）。"""
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    for pat in _RE_VOL_PATTERNS:
+        m = pat.search(stem)
+        if m:
+            try:
+                v = int(m.group(1))
+                if 0 < v <= 9999:
+                    return v
+            except (ValueError, IndexError):
+                continue
     return None
 
 
@@ -117,6 +158,25 @@ def plan_renames(folder, prefix, mode="auto"):
         new = f"{prefix} v{num:02d}.cbz" if prefix else f"v{num:02d}.cbz"
         plan.append((old, new))
     return plan
+
+
+def find_conflicts(plan, folder):
+    """返回冲突列表：目标名在两个源之间重复，或目标名已被非自身文件占用。"""
+    from collections import Counter
+    target_counts = Counter(new for _, new in plan)
+    conflicts = []
+    for old, new in plan:
+        if target_counts[new] > 1:
+            conflicts.append(f"{new}（多个文件重名）")
+        elif old != new and os.path.exists(os.path.join(folder, new)):
+            conflicts.append(f"{new}（已存在同名文件）")
+    # 去重保序
+    seen, out = set(), []
+    for c in conflicts:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
 
 
 class RenameDialog(tk.Toplevel):
@@ -257,32 +317,53 @@ class RenameDialog(tk.Toplevel):
         plan = plan_renames(folder, self.prefix_var.get().strip(),
                             "auto" if self.mode_var.get() == "自动提取" else "seq")
         plan = [(old, new) for old, new in plan if old not in self.skipped]  # 过滤已取消的文件
-        targets = [os.path.join(folder, new) for _, new in plan]
-        conflicts = [new for (old, new), t in zip(plan, targets)
-                     if os.path.exists(t) and os.path.basename(t) != old]
-        if conflicts:
-            messagebox.showerror("冲突", "以下新文件名已存在，未执行：\n" + "\n".join(conflicts))
-            return
         if not plan:
             if self.skipped:
                 messagebox.showinfo("提示", "所有文件都已取消（跳过），没有可重命名的文件")
             else:
                 messagebox.showinfo("提示", "没有可重命名的文件")
             return
+        conflicts = find_conflicts(plan, folder)
+        if conflicts:
+            messagebox.showerror("冲突", "以下目标文件名存在冲突，未执行任何重命名：\n"
+                                 + "\n".join(conflicts))
+            return
+        no_change = all(old == new for old, new in plan)
+        if no_change:
+            messagebox.showinfo("提示", "文件名已符合目标格式，无需修改")
+            return
         if not messagebox.askyesno("确认", f"将重命名 {len(plan)} 个文件，继续？"):
             return
+        # 两步走：先全部改成临时唯一名，再改成目标名。避免 A->B、B->C 的链式互相覆盖。
+        staged = []
         ok = 0
-        for old, new in plan:
+        errs = []
+        for k, (old, new) in enumerate(plan):
             src = os.path.join(folder, old)
+            tmp = os.path.join(folder, f".__rn_{k}_{os.getpid()}.tmp")
+            try:
+                os.rename(src, tmp)
+                staged.append((tmp, new, old))
+            except OSError as e:
+                errs.append(f"{old}：{e}")
+        for tmp, new, old in staged:
             dst = os.path.join(folder, new)
             try:
-                os.rename(src, dst)
+                if os.path.exists(dst):
+                    raise OSError("目标文件已存在（可能被其他程序占用）")
+                os.rename(tmp, dst)
                 ok += 1
             except OSError as e:
-                messagebox.showerror("失败", f"{old}：{e}")
+                errs.append(f"{old} -> {new}：{e}")
+                try:                       # 回滚该文件，避免留 .tmp
+                    os.rename(tmp, os.path.join(folder, old))
+                except OSError:
+                    pass
         msg = f"已重命名 {ok}/{len(plan)} 个文件"
         if self.skipped:
             msg += f"（取消 {len(self.skipped)} 个）"
+        if errs:
+            msg += "\n\n失败项：\n" + "\n".join(errs[:10])
         messagebox.showinfo("完成", msg)
         self._refresh()
 
@@ -303,6 +384,8 @@ class App(tk.Tk):
         self.workers = tk.StringVar(value="6")
         self.running = False
         self._done_count = 0
+        self._pool = None
+        self._cancelled = False
 
         self._build_ui()
 
@@ -356,6 +439,8 @@ class App(tk.Tk):
         row.pack(fill="x", padx=8, pady=4)
         self.btn_start = ttk.Button(row, text="开始转换", command=self.start)
         self.btn_start.pack(side="left")
+        self.btn_cancel = ttk.Button(row, text="停止", command=self.cancel, state="disabled")
+        self.btn_cancel.pack(side="left", padx=6)
         ttk.Button(row, text="批量重命名 CBZ…", command=self.open_rename).pack(side="left", padx=8)
         self.progress = ttk.Progressbar(row, mode="determinate")
         self.progress.pack(side="left", fill="x", expand=True, padx=8)
@@ -418,26 +503,40 @@ class App(tk.Tk):
         self.log.configure(state="disabled")
 
     # ---------- 转换（多进程并行） ----------
-    def _set_status(self, i, status):
-        children = self.tree.get_children()
-        if 0 <= i < len(children):
-            item = children[i]
+    def _set_status_by_path(self, path, status):
+        """按文件路径回写状态，避免「过滤掉已完成项后 index 错位」。"""
+        for item in self.tree.get_children():
             vals = list(self.tree.item(item, "values"))
-            vals[2] = status
-            self.tree.item(item, values=vals)
+            if os.path.normpath(vals[1]) == os.path.normpath(path):
+                vals[2] = status
+                self.tree.item(item, values=vals)
+                return
+        # 回退：找不到就按文件名匹配
+        name = os.path.basename(path)
+        for item in self.tree.get_children():
+            vals = list(self.tree.item(item, "values"))
+            if vals[0] == name:
+                vals[2] = status
+                self.tree.item(item, values=vals)
+                return
 
-    def _on_one_done(self, idx, ok, msg):
+    def _on_one_done(self, path, ok, msg):
         self.log_line(msg)
-        self._set_status(idx, "完成" if ok else "失败/跳过")
+        self._set_status_by_path(path, "完成" if ok else "失败/跳过")
         self._done_count += 1
         self.progress.configure(value=self._done_count)
+        # 同步内存状态：仅「完成」被排除出后续运行，失败项仍可重试
+        for f in self.files:
+            if os.path.normpath(f[0]) == os.path.normpath(path):
+                f[1] = "完成" if ok else ""
+                break
 
     def start(self):
         if self.running:
             return
         todo = [f[0] for f in self.files if f[1] != "完成"]
         if not todo:
-            messagebox.showinfo("提示", "请先添加 PDF 文件")
+            messagebox.showinfo("提示", "没有待转换的 PDF（已完成的不会重复转换）")
             return
         out_dir = self.out_dir.get().strip()
         if not out_dir:
@@ -447,23 +546,45 @@ class App(tk.Tk):
             messagebox.showwarning("提示", "输出目录不存在")
             return
 
+        _cleanup_stale_tmp(out_dir)
+
         keep = self.keep_images.get()
         ove = self.overwrite.get()
-        n_workers = int(self.workers.get())
-        params = [(i, path, out_dir, keep, ove) for i, path in enumerate(todo)]
+        try:
+            n_workers = max(1, min(16, int(self.workers.get())))
+        except ValueError:
+            n_workers = 4
+
+        # 任务键用文件路径（唯一），而非序号 —— 序号在过滤后会错位。
+        params = [(p, p, out_dir, keep, ove) for p in todo]
 
         self.running = True
         self._done_count = 0
+        self._pool = None
+        self._cancelled = False
         self.btn_start.config(state="disabled")
+        self.btn_cancel.config(state="normal")
         self.progress.configure(maximum=len(todo), value=0)
         self.log_line(f"== 开始转换 {len(todo)} 个文件（并行 {n_workers}），输出到：{out_dir} ==")
 
         def worker():
             try:
-                with multiprocessing.Pool(n_workers) as pool:
-                    for idx, ok, msg in pool.imap_unordered(convert_pdf_to_cbz, params):
-                        self.after(0, self._on_one_done, idx, ok, msg)
-                self.after(0, self.log_line, "== 全部处理结束 ==")
+                # maxtasksperchild 限制单进程内存累积，避免大 PDF 长跑内存泄漏
+                pool = multiprocessing.Pool(n_workers, maxtasksperchild=8)
+                self._pool = pool
+                try:
+                    for key, ok, msg in pool.imap_unordered(convert_pdf_to_cbz, params):
+                        if self._cancelled:
+                            break
+                        self.after(0, self._on_one_done, key, ok, msg)
+                finally:
+                    pool.terminate()
+                    pool.join()
+                    self._pool = None
+                if self._cancelled:
+                    self.after(0, self.log_line, "== 已停止（未完成的任务被中止）==")
+                else:
+                    self.after(0, self.log_line, "== 全部处理结束 ==")
             except Exception as e:
                 self.after(0, self.log_line, f"异常：{e}")
             finally:
@@ -471,9 +592,27 @@ class App(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def cancel(self):
+        if not self.running:
+            return
+        if not messagebox.askyesno("确认停止", "确定要停止转换吗？\n正在处理的文件会被中止，已完成的不受影响。"):
+            return
+        self._cancelled = True
+        self.btn_cancel.config(state="disabled")
+        self.log_line("== 收到停止请求，正在中止… ==")
+        pool = self._pool
+        if pool is not None:
+            try:
+                pool.terminate()
+            except Exception:
+                pass
+
     def _finish(self):
         self.running = False
+        self._cancelled = False
+        self._pool = None
         self.btn_start.config(state="normal")
+        self.btn_cancel.config(state="disabled")
 
 
 if __name__ == "__main__":
