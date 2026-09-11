@@ -26,6 +26,12 @@ import pymupdf
 ConvertJob = namedtuple("ConvertJob", "key pdf_path out_dir keep_images overwrite")
 
 
+def _safe_stem(name):
+    """清洗卷名，使其可安全用作目录名（去 Windows 非法字符与首尾空格/点）。"""
+    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
+    return stem or "untitled"
+
+
 def _cleanup_stale_tmp(out_dir):
     """清理输出目录里上次崩溃残留的 .tmp_* 目录（在开始转换前调用）。"""
     try:
@@ -66,8 +72,16 @@ def convert_pdf_to_cbz(job):
     if os.path.exists(cbz) and not overwrite:
         return key, False, f"跳过：{vol}.cbz 已存在（勾选“覆盖”可重做）"
 
-    # 中间文件放系统临时目录，避免污染输出目录；进程崩溃也不留垃圾在 out_dir。
-    work = tempfile.mkdtemp(prefix=f"pdf2cbz_{os.getpid()}_")
+    # 中间文件默认放系统临时目录（用完即删，不污染输出目录）。
+    # 但勾选「保留中间图片」时，必须放到输出目录下用户能看到的位置，
+    # 否则「保留」等于没保留（图藏在 %TEMP% 里没人找得到）。
+    if keep_images:
+        work = os.path.join(out_dir, _safe_stem(vol) + "_images")
+        os.makedirs(work, exist_ok=True)
+        work_is_temp = False
+    else:
+        work = tempfile.mkdtemp(prefix=f"pdf2cbz_{os.getpid()}_")
+        work_is_temp = True
     try:
         saved = []
         with pymupdf.open(pdf_path) as doc:
@@ -107,9 +121,12 @@ def convert_pdf_to_cbz(job):
                     pass
 
         size_mb = os.path.getsize(cbz) / 1024 / 1024
-        if not keep_images:
+        note = f"{len(saved)} 张唯一图片，{size_mb:.1f} MB"
+        if keep_images:
+            note += f"；图片已保留到 {os.path.basename(work)}\\"
+        elif work_is_temp:
             shutil.rmtree(work, ignore_errors=True)
-        return key, True, f"完成：{vol}.cbz（{len(saved)} 张唯一图片，{size_mb:.1f} MB）"
+        return key, True, f"完成：{vol}.cbz（{note}）"
     except Exception as e:
         shutil.rmtree(work, ignore_errors=True)
         return key, False, f"失败：{base}：{e}\n{traceback.format_exc()}"
