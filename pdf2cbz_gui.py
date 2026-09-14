@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """PDF 转 CBZ 漫画打包工具
-功能：选择 PDF/文件夹 -> 无损提取图片（原格式、xref+MD5 去重）-> 多进程并行打包为 CBZ
+功能：选择 PDF/文件夹 -> 无损提取图片（保原格式、xref+MD5 去重）
+     -> 多进程并行打包为 CBZ（已压缩格式 STORED，原始位图 DEFLATE）
      附带：批量重命名 CBZ（统一为“名称 v卷号”格式）
 说明：PyMuPDF 官方不支持多线程，并行采用多进程（每个进程独立打开 PDF）。
 """
@@ -23,7 +24,7 @@ import pymupdf
 
 
 # 转换任务参数：用具名元组替代裸元组，避免位置传参错位，且可被 pickle。
-ConvertJob = namedtuple("ConvertJob", "key pdf_path out_dir keep_images overwrite")
+ConvertJob = namedtuple("ConvertJob", "pdf_path out_dir keep_images overwrite")
 
 
 _LOG_MAX_LINES = 3000
@@ -33,6 +34,18 @@ def _safe_stem(name):
     """清洗卷名，使其可安全用作目录名（去 Windows 非法字符与首尾空格/点）。"""
     stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
     return stem or "untitled"
+
+
+# 本身就是压缩格式的图片：再 DEFLATE 一遍几乎不省体积，纯烧 CPU，直接 STORED。
+# 其余（bmp / tiff / ppm 等原始位图）走 DEFLATE，否则 CBZ 可能比原 PDF 还大。
+_PRE_COMPRESSED_EXTS = {"jpg", "jpeg", "png", "webp", "gif",
+                        "jpx", "jp2", "jbig2", "jb2"}
+
+
+def _zip_compress_type(ext):
+    """按图片扩展名选 zip 压缩方式。未知格式一律 DEFLATE（宁慢勿胖）。"""
+    return (zipfile.ZIP_STORED if (ext or "").lower() in _PRE_COMPRESSED_EXTS
+            else zipfile.ZIP_DEFLATED)
 
 
 def _list_cbz(folder):
@@ -45,12 +58,13 @@ def _list_cbz(folder):
 
 
 def _cleanup_stale_tmp(out_dir):
-    """清理上次崩溃/中断遗留的中间产物。
-    覆盖两类历史命名：早期版本的 `.tmp_*` 与重命名回滚的 `.__rn_*.tmp`。"""
+    """清理上次崩溃/中断遗留的中间产物。覆盖三类命名：
+    早期版本的 `.tmp_*`、重命名回滚的 `.__rn_*.tmp`、打包中断的 `*.cbz.part`。"""
     try:
         for name in os.listdir(out_dir):
             if name.startswith(".tmp_") or (
-                    name.startswith(".__rn_") and name.endswith(".tmp")):
+                    name.startswith(".__rn_") and name.endswith(".tmp")) or (
+                    name.lower().endswith(".cbz.part")):
                 p = os.path.join(out_dir, name)
                 try:
                     if os.path.isdir(p):
@@ -80,8 +94,11 @@ def scan_pdfs(folder, recursive=False):
 
 def convert_pdf_to_cbz(job):
     """转换单个 PDF（多进程 worker）。入参为 ConvertJob（可 pickle）。
-    返回 (key, 是否成功, 消息)。key 用于回写状态，避免顺序错位。"""
-    key = job.key
+    返回 (pdf_path, 是否成功, 消息)。路径唯一，用于回写状态，避免顺序错位。
+
+    keep_images=False：流式直写 zip（单张图片进内存，写完即释放，零临时文件）。
+    keep_images=True：提取到系统 temp 唯一目录（并行 worker 互不干扰），
+    打包完成后原子移入输出目录的 <卷名>_images\。"""
     pdf_path = job.pdf_path
     out_dir = job.out_dir
     keep_images = job.keep_images
@@ -91,54 +108,40 @@ def convert_pdf_to_cbz(job):
     cbz = os.path.join(out_dir, vol + ".cbz")
 
     if os.path.exists(cbz) and not overwrite:
-        return key, False, f"跳过：{vol}.cbz 已存在（勾选“覆盖”可重做）"
+        return pdf_path, False, f"跳过：{vol}.cbz 已存在（勾选“覆盖”可重做）"
 
-    # 中间文件默认放系统临时目录（用完即删，不污染输出目录）。
-    # 但勾选「保留中间图片」时，必须放到输出目录下用户能看到的位置，
-    # 否则「保留」等于没保留（图藏在 %TEMP% 里没人找得到）。
-    if keep_images:
-        work = os.path.join(out_dir, _safe_stem(vol) + "_images")
-        if os.path.isdir(work):
-            # 覆盖重跑时清空旧图，避免上个版本的 img_00N 混进来被用户误取
-            shutil.rmtree(work, ignore_errors=True)
-        os.makedirs(work, exist_ok=True)
-        work_is_temp = False
-    else:
-        work = tempfile.mkdtemp(prefix=f"pdf2cbz_{os.getpid()}_")
-        work_is_temp = True
+    work = tempfile.mkdtemp(prefix=f"pdf2cbz_{os.getpid()}_") if keep_images else None
     try:
-        saved = []
-        with pymupdf.open(pdf_path) as doc:
-            seen_xref, seen_hash = set(), set()
-            for page in doc:
-                for img in page.get_images(full=True):
-                    xref = img[0]
-                    if xref in seen_xref:
-                        continue
-                    seen_xref.add(xref)
-                    info = doc.extract_image(xref)          # 原始字节，无损、保原格式
-                    d = hashlib.md5(info["image"]).hexdigest()
-                    if d in seen_hash:
-                        continue
-                    seen_hash.add(d)
-                    n = len(saved) + 1
-                    fname = f"img_{n:03d}.{info['ext']}"
-                    with open(os.path.join(work, fname), "wb") as f:
-                        f.write(info["image"])
-                    saved.append(fname)
-
-        if not saved:
-            if not keep_images and work_is_temp:
-                shutil.rmtree(work, ignore_errors=True)
-            return key, False, f"失败：{base} 未提取到任何图片"
-
-        # 先写临时文件再原子替换，避免中途失败留下半截 CBZ。
+        saved = 0
         tmp_cbz = cbz + ".part"
         try:
-            with zipfile.ZipFile(tmp_cbz, "w", zipfile.ZIP_STORED) as z:
-                for fn in saved:
-                    z.write(os.path.join(work, fn), arcname=fn)
-            os.replace(tmp_cbz, cbz)          # 原子；Windows/POSIX 均可覆盖
+            with zipfile.ZipFile(tmp_cbz, "w", zipfile.ZIP_STORED) as z, \
+                 pymupdf.open(pdf_path) as doc:
+                seen_xref, seen_hash = set(), set()
+                for page in doc:
+                    for img in page.get_images(full=True):
+                        xref = img[0]
+                        if xref in seen_xref:
+                            continue
+                        seen_xref.add(xref)
+                        info = doc.extract_image(xref)      # 原始字节，无损、保原格式
+                        d = hashlib.md5(info["image"]).hexdigest()
+                        if d in seen_hash:
+                            continue
+                        seen_hash.add(d)
+                        saved += 1
+                        ext = info["ext"]
+                        fname = f"img_{saved:03d}.{ext}"
+                        # 直写 zip：bytes 写入磁盘上的 .part 后即可释放，
+                        # 峰值内存 = 单张图。压缩方式按格式逐张选。
+                        z.writestr(fname, info["image"],
+                                   compress_type=_zip_compress_type(ext))
+                        if keep_images:
+                            with open(os.path.join(work, fname), "wb") as f:
+                                f.write(info["image"])
+            if not saved:
+                return pdf_path, False, f"失败：{base} 未提取到任何图片"
+            os.replace(tmp_cbz, cbz)      # 原子；Windows/POSIX 均可覆盖
         finally:
             if os.path.exists(tmp_cbz):
                 try:
@@ -147,15 +150,41 @@ def convert_pdf_to_cbz(job):
                     pass
 
         size_mb = os.path.getsize(cbz) / 1024 / 1024
-        note = f"{len(saved)} 张唯一图片，{size_mb:.1f} MB"
+        note = f"{saved} 张唯一图片，{size_mb:.1f} MB"
         if keep_images:
-            note += f"；图片已保留到 {os.path.basename(work)}\\"
-        elif work_is_temp:
-            shutil.rmtree(work, ignore_errors=True)
-        return key, True, f"完成：{vol}.cbz（{note}）"
+            # 原子移入输出目录：先到 .tmp_imgs_<pid> 暂存，再 rename 成正式名。
+            # 暂存名命中启动清理的 .tmp_* 规则，中断残留下次自动扫掉。
+            dst = os.path.join(out_dir, _safe_stem(vol) + "_images")
+            staging = os.path.join(out_dir, f".tmp_imgs_{os.getpid()}")
+            try:
+                if os.path.isdir(dst):
+                    shutil.rmtree(dst, ignore_errors=True)   # 覆盖重跑清旧图
+                shutil.move(work, staging)          # 跨盘时为 copy+delete，可接受
+                os.rename(staging, dst)             # 同盘 rename，原子
+                work = None                         # 已移走，不再归本进程管
+                note += f"；图片已保留到 {os.path.basename(dst)}\\"
+            except OSError as e:
+                # CBZ 已经落盘，图片目录搬家失败不该把整件事报成失败。
+                # 也不能把它留在 .tmp_imgs_* —— 那个名字下次启动会被当垃圾清掉。
+                where = staging if os.path.isdir(staging) else work
+                salvage = os.path.join(out_dir, _safe_stem(vol) + "_images.partial")
+                try:
+                    if os.path.isdir(where):
+                        shutil.rmtree(salvage, ignore_errors=True)
+                        shutil.move(where, salvage)
+                        note += f"；图片目录更名失败（{e}），已暂存为 {os.path.basename(salvage)}"
+                    else:
+                        note += f"；图片目录更名失败（{e}）"
+                except OSError:
+                    note += f"；图片目录更名失败（{e}），图片残留在 {where}"
+                work = None     # 无论落在哪，都别再被 finally 删掉
+        return pdf_path, True, f"完成：{vol}.cbz（{note}）"
     except Exception as e:
-        shutil.rmtree(work, ignore_errors=True)
-        return key, False, f"失败：{base}：{e}\n{traceback.format_exc()}"
+        return pdf_path, False, f"失败：{base}：{e}\n{traceback.format_exc()}"
+    finally:
+        # work 为 None（已移走）或 keep_images=False（本来就是 None）时不清理
+        if work is not None:
+            shutil.rmtree(work, ignore_errors=True)
 
 
 # ---------- 批量重命名 ----------
@@ -236,6 +265,7 @@ class RenameDialog(tk.Toplevel):
         self.prefix_var = tk.StringVar(value="")
         self.mode_var = tk.StringVar(value="自动提取")
         self.skipped = set()  # 被取消（跳过）重命名的原文件名集合
+        self._snapshot_olds = None   # 最近一次预览时的文件名集合（防 TOCTOU）
 
         row1 = ttk.Frame(self)
         row1.pack(fill="x", padx=8, pady=4)
@@ -302,6 +332,7 @@ class RenameDialog(tk.Toplevel):
             self.lbl.config(text="该目录下没有 .cbz 文件")
             return
         existing = {old for old, _ in plan}
+        self._snapshot_olds = existing   # 记录预览时刻的目录内容
         self.skipped &= existing  # 清理已不在列表中的跳过项
         for old, new in plan:
             if old in self.skipped:
@@ -362,6 +393,15 @@ class RenameDialog(tk.Toplevel):
             return
         plan = plan_renames(folder, self.prefix_var.get().strip(),
                             "auto" if self.mode_var.get() == "自动提取" else "seq")
+        # TOCTOU 防护：预览之后目录内容若变化，执行的计划与用户看到的不一致
+        current_olds = {old for old, _ in plan}
+        if self._snapshot_olds is not None and current_olds != self._snapshot_olds:
+            messagebox.showwarning(
+                "目录已变化",
+                "预览之后目录内容发生了变化（文件增删或重命名）。\n"
+                "列表已自动刷新为最新计划，请确认无误后再点「执行重命名」。")
+            self._refresh()
+            return
         plan = [(old, new) for old, new in plan if old not in self.skipped]  # 过滤已取消的文件
         if not plan:
             if self.skipped:
@@ -662,7 +702,7 @@ class App(tk.Tk):
             n_workers = 4
 
         # 任务键用文件路径（唯一），而非序号 —— 序号在过滤后会错位。
-        params = [ConvertJob(key=p, pdf_path=p, out_dir=out_dir,
+        params = [ConvertJob(pdf_path=p, out_dir=out_dir,
                              keep_images=keep, overwrite=ove) for p in todo]
 
         self.running = True
