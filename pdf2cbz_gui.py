@@ -6,7 +6,6 @@
 """
 import os
 import re
-import glob
 import hashlib
 import zipfile
 import shutil
@@ -27,19 +26,40 @@ import pymupdf
 ConvertJob = namedtuple("ConvertJob", "key pdf_path out_dir keep_images overwrite")
 
 
+_LOG_MAX_LINES = 3000
+
+
 def _safe_stem(name):
     """清洗卷名，使其可安全用作目录名（去 Windows 非法字符与首尾空格/点）。"""
     stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
     return stem or "untitled"
 
 
+def _list_cbz(folder):
+    """列出目录下的 CBZ，大小写不敏感（.cbz / .CBZ 都收）。"""
+    return sorted(
+        (entry.path for entry in os.scandir(folder)
+         if entry.is_file() and entry.name.lower().endswith(".cbz")),
+        key=lambda p: _nat_key(os.path.basename(p)),
+    )
+
+
 def _cleanup_stale_tmp(out_dir):
-    """清理输出目录里上次崩溃残留的 .tmp_* 目录（在开始转换前调用）。"""
+    """清理上次崩溃/中断遗留的中间产物。
+    覆盖两类历史命名：早期版本的 `.tmp_*` 与重命名回滚的 `.__rn_*.tmp`。"""
     try:
-        for d in glob.glob(os.path.join(out_dir, ".tmp_*")):
-            if os.path.isdir(d):
-                shutil.rmtree(d, ignore_errors=True)
-    except Exception:
+        for name in os.listdir(out_dir):
+            if name.startswith(".tmp_") or (
+                    name.startswith(".__rn_") and name.endswith(".tmp")):
+                p = os.path.join(out_dir, name)
+                try:
+                    if os.path.isdir(p):
+                        shutil.rmtree(p, ignore_errors=True)
+                    else:
+                        os.remove(p)
+                except OSError:
+                    pass
+    except OSError:
         pass
 
 
@@ -78,6 +98,9 @@ def convert_pdf_to_cbz(job):
     # 否则「保留」等于没保留（图藏在 %TEMP% 里没人找得到）。
     if keep_images:
         work = os.path.join(out_dir, _safe_stem(vol) + "_images")
+        if os.path.isdir(work):
+            # 覆盖重跑时清空旧图，避免上个版本的 img_00N 混进来被用户误取
+            shutil.rmtree(work, ignore_errors=True)
         os.makedirs(work, exist_ok=True)
         work_is_temp = False
     else:
@@ -105,6 +128,8 @@ def convert_pdf_to_cbz(job):
                     saved.append(fname)
 
         if not saved:
+            if not keep_images and work_is_temp:
+                shutil.rmtree(work, ignore_errors=True)
             return key, False, f"失败：{base} 未提取到任何图片"
 
         # 先写临时文件再原子替换，避免中途失败留下半截 CBZ。
@@ -167,7 +192,7 @@ def _nat_key(name):
 
 def plan_renames(folder, prefix, mode="auto"):
     """计算重命名计划。返回 [(原名, 新名)]，不执行。"""
-    cbzs = sorted(glob.glob(os.path.join(folder, "*.cbz")), key=_nat_key)
+    cbzs = _list_cbz(folder)
     plan = []
     for i, p in enumerate(cbzs, start=1):
         old = os.path.basename(p)
@@ -555,6 +580,10 @@ class App(tk.Tk):
         写文件失败绝不影响主流程（例如目录只读、被占用）。"""
         self.log.configure(state="normal")
         self.log.insert("end", s + "\n")
+        # 限制行数，避免长会话把日志堆到吃掉内存（最旧的先丢）
+        n = int(self.log.index("end-1c").split(".")[0])
+        if n > _LOG_MAX_LINES:
+            self.log.delete("1.0", f"{n - _LOG_MAX_LINES}.0")
         self.log.see("end")
         self.log.configure(state="disabled")
         if to_file:
@@ -663,9 +692,7 @@ class App(tk.Tk):
                         pool.join()
                         return
                     self._pool = pool
-                sent = 0
                 for key, ok, msg in pool.imap_unordered(convert_pdf_to_cbz, params):
-                    sent += 1
                     with self._state_lock:
                         cancelled = self._cancelled
                     if cancelled:
