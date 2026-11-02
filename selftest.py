@@ -130,9 +130,17 @@ def run():
 
     check("count_pages", batch.count_pages(pdf) == 3, batch.count_pages(pdf))
     rjob = batch.RangeJob(pdf, os.path.join(d_split, "x.cbz.p00000.part"), 0, 1)
-    tag, _part, ok_r, _m, n_r = batch.run_job(rjob)
+    tag, _part, ok_r, _m, n_r, label_r, el_r = batch.run_job(rjob)
     check("run_job 分派到页段", tag == "range" and ok_r and n_r == 2, (tag, ok_r, n_r))
+    check("页段回报页区间与耗时", label_r == "第 1–1 页" and el_r >= 0, (label_r, el_r))
     os.remove(_part)
+
+    # 页进度回调：每页一次，带总页数
+    seen = []
+    list(extractor.iter_unique_images(pdf, on_page=lambda p, t: seen.append((p, t))))
+    check("on_page 每页回调一次", seen == [(0, 3), (1, 3), (2, 3)], seen)
+    check("ConvertJob 四参调用仍可用",
+          batch.ConvertJob("a", "b", False, False).progress is None)
 
     # --- 3. 与上游单文件等价（PDF2CBZ_ORIG 指向上游 pdf2cbz_gui.py） ---
     orig = load_upstream()

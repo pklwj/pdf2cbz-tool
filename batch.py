@@ -7,6 +7,7 @@ PyMuPDF 底层 MuPDF 不保证线程安全，所以并行只能走多进程（�
 import os
 import shutil
 import tempfile
+import time
 import traceback
 from collections import namedtuple
 
@@ -15,9 +16,28 @@ import pymupdf
 import archive
 
 # 转换任务参数：用具名元组替代裸元组，避免位置传参错位，且可被 pickle。
-ConvertJob = namedtuple("ConvertJob", "pdf_path out_dir keep_images overwrite")
+# progress 是 Manager().Queue() 的代理，worker 往里丢 (标签, 已处理页, 总页数)；
+# 不需要进度时留 None（旧的四参调用保持可用）。
+ConvertJob = namedtuple("ConvertJob", "pdf_path out_dir keep_images overwrite progress",
+                        defaults=(None,))
 # 页段任务：单文件吃多核用。一整册按页切段，各段写自己的临时 zip，最后合并。
 RangeJob = namedtuple("RangeJob", "pdf_path part start end")
+
+
+def _throttled_page_cb(q, label, interval=0.4):
+    """页进度回调：限流后再塞进队列，避免每页都跨进程通信把日志冲爆。"""
+    last = [0.0]
+
+    def cb(pno, total):
+        now = time.time()
+        if pno + 1 >= total or now - last[0] >= interval:
+            last[0] = now
+            try:
+                q.put((label, pno + 1, total))
+            except Exception:
+                pass          # 队列已关闭（用户点了停止）就算了
+
+    return cb
 
 
 def scan_pdfs(folder, recursive=False):
@@ -94,9 +114,11 @@ def convert_pdf_to_cbz(job):
         return pdf_path, False, f"跳过：{vol}.cbz 已存在（勾选“覆盖”可重做）"
 
     work = tempfile.mkdtemp(prefix=f"pdf2cbz_{os.getpid()}_") if keep_images else None
+    progress = getattr(job, "progress", None)
+    on_page = _throttled_page_cb(progress, vol) if progress is not None else None
     try:
         try:
-            saved = archive.build_cbz(pdf_path, cbz, image_sink=work)
+            saved = archive.build_cbz(pdf_path, cbz, image_sink=work, on_page=on_page)
         except archive.NoImagesError:
             return pdf_path, False, f"失败：{base} 未提取到任何图片"
 
@@ -154,15 +176,17 @@ def count_pages(pdf_path):
 def convert_range(job):
     """页段 worker：把 [start, end) 页写成临时 zip。
 
-    返回 (part, 是否成功, 消息, 图片数)，消息只在失败时有内容。
+    返回 (part, 是否成功, 消息, 图片数, 页区间文案, 耗时秒)，消息只在失败时有内容。
     """
+    t0 = time.time()
+    label = f"第 {job.start + 1}–{job.end} 页"
     try:
         n, _ = archive.write_part(job.pdf_path, job.part, job.start, job.end)
     except Exception as e:
-        return job.part, False, f"{e}\n{traceback.format_exc()}", 0
+        return job.part, False, f"{e}\n{traceback.format_exc()}", 0, label, 0.0
     if not n:
-        return job.part, False, f"第 {job.start + 1}–{job.end} 页没有图片", 0
-    return job.part, True, "", n
+        return job.part, False, f"{label}没有图片", 0, label, 0.0
+    return job.part, True, "", n, label, round(time.time() - t0, 1)
 
 
 def run_job(job):

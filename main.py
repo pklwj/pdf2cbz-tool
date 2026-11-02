@@ -238,6 +238,10 @@ class App(tk.Tk):
         self._run_total = 0
         # 工作线程只往队列里放事件，所有界面读写都回主线程做（Tk 非线程安全）
         self._events = queue.Queue()
+        self._progress_q = None      # Manager 队列：worker 上报页进度
+        self._manager = None
+        self._prog_marks = {}        # 文件名 → Text mark，一文件一行原地刷新
+        self._prog_seq = 0
         # 保护跨线程共享字段（_pool / _cancelled），主线程与 worker 线程都会读写
         self._state_lock = threading.Lock()
 
@@ -423,6 +427,7 @@ class App(tk.Tk):
         n = int(self.log.index("end-1c").split(".")[0])
         if n > _LOG_MAX_LINES:
             self.log.delete("1.0", f"{n - _LOG_MAX_LINES}.0")
+            self._prog_marks.clear()    # 行被删过，旧 mark 位置已不可信
         self.log.see("end")
         self.log.configure(state="disabled")
         if to_file:
@@ -443,6 +448,54 @@ class App(tk.Tk):
         except OSError:
             pass          # 日志写不出不是致命错误，忽略即可
 
+    def _render_progress(self, label, done, total):
+        """每个文件在日志区占一行，原位刷新「页进度」。
+
+        用 Text mark 锚定行首：多文件并发时各改各的行，不会互相覆盖或错位。
+        只进 GUI，不写 pdf2cbz.log —— 进度每秒好几条，落盘会把日志冲成流水账。
+        """
+        if total <= 0:
+            return
+        pct = done * 100 // total
+        txt = f"  {label}：{done}/{total} 页（{pct}%）"
+        self.log.configure(state="normal")
+        mark = self._prog_marks.get(label)
+        try:
+            if mark is None:
+                self.log.insert("end", txt + "\n")
+                mark = f"pg{self._prog_seq}"
+                self._prog_seq += 1
+                line = int(self.log.index("end-1c").split(".")[0]) - 1
+                self.log.mark_set(mark, f"{line}.0")
+                self.log.mark_gravity(mark, "left")
+                self._prog_marks[label] = mark
+            else:
+                self.log.delete(mark, f"{mark} lineend")
+                self.log.insert(mark, txt)
+        except tk.TclError:
+            self._prog_marks.pop(label, None)      # mark 失效就下次重建
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def _drain_progress(self):
+        """取走队列里的页进度，按文件各留最后一条再渲染。
+
+        多文件并行时不能只取全局最后一条 —— 那样只有一个文件能显示进度。
+        """
+        if self._progress_q is None:
+            return
+        latest = {}
+        while True:
+            try:
+                label, done, total = self._progress_q.get_nowait()
+            except queue.Empty:
+                break
+            except (EOFError, OSError):
+                return          # Manager 已关闭
+            latest[label] = (done, total)     # dict 保留插入顺序
+        for label, (done, total) in latest.items():
+            self._render_progress(label, done, total)
+
     # ---------- 转换（多进程并行） ----------
     def _pump(self):
         """在主线程消费 worker 投递的事件。
@@ -456,14 +509,17 @@ class App(tk.Tk):
             except queue.Empty:
                 break
             if kind == "done":
+                self._drain_progress()      # 先把该文件最后的页进度画完
                 self._on_one_done(*payload)
             elif kind == "range":
                 self._on_range_done(*payload)
             elif kind == "log":
                 self.log_line(payload)
             elif kind == "end":
+                self._drain_progress()      # 先把残留进度画完，_finish 会关掉队列
                 self._on_run_end(payload)
                 self._finish()
+        self._drain_progress()
         if self.running:
             self.after(80, self._pump)
 
@@ -484,13 +540,16 @@ class App(tk.Tk):
                 self.tree.item(item, values=vals)
                 return
 
-    def _on_range_done(self, part, ok, msg):
-        """一个页段完成：推进进度、改标题；失败只在日志里留痕。"""
+    def _on_range_done(self, part, ok, msg, n=0, label="", elapsed=0.0):
+        """一个页段完成：推进进度、改标题，并在日志里留一行明细。"""
         self._done_count += 1
         self.progress.configure(value=self._done_count)
         self.title(f"{_APP_TITLE} — 分段 {self._done_count}/{self._run_total - 1}")
-        if not ok:
-            self.log_line(f"页段失败：{msg}")
+        if ok:
+            self.log_line(f"  页段 {self._done_count}/{self._run_total - 1}："
+                          f"{label} → {n} 张，{elapsed:.1f}s")
+        else:
+            self.log_line(f"  页段失败：{msg}")
 
     def _on_one_done(self, path, ok, msg):
         self.log_line(msg)
@@ -553,6 +612,17 @@ class App(tk.Tk):
             if pages >= _SPLIT_MIN_PAGES and (ove or not os.path.exists(os.path.join(out_dir, vol + ".cbz"))):
                 split = (todo[0], pages, vol)
 
+        # 页进度要跨进程回传：Manager 队列的代理可 pickle，能塞进任务里传给 worker。
+        # 分段模式不建（进度按段计就够），省掉一个常驻进程。
+        self._manager = None
+        self._progress_q = None
+        if not split:
+            try:
+                self._manager = multiprocessing.Manager()
+                self._progress_q = self._manager.Queue()
+            except Exception:
+                self._manager = None      # 起不来就退化成没有页进度
+
         if split:
             pdf, pages, vol = split
             seg = min(n_workers, pages)
@@ -562,11 +632,13 @@ class App(tk.Tk):
                       for s in range(0, pages, step)]
         else:
             # 任务键用文件路径（唯一），而非序号 —— 序号在过滤后会错位。
-            params = [batch.ConvertJob(pdf_path=p, out_dir=out_dir,
-                                       keep_images=keep, overwrite=ove) for p in todo]
+            params = [batch.ConvertJob(pdf_path=p, out_dir=out_dir, keep_images=keep,
+                                       overwrite=ove, progress=self._progress_q) for p in todo]
 
         self.running = True
         self._done_count = 0
+        self._prog_marks.clear()
+        self._prog_seq = 0
         self._events = queue.Queue()      # 新一轮，丢掉上一轮残留事件
         # 分段时进度按「段数 + 1 次合并」计，否则按文件数计
         self._run_total = len(params) + (1 if split else 0)
@@ -605,12 +677,12 @@ class App(tk.Tk):
                     if cancelled:
                         break
                     if res[0] == "range":
-                        _, part, ok, msg, _n = res
+                        _, part, ok, msg, n, label, elapsed = res
                         if ok:
                             done_parts.append(part)
                         else:
                             range_failed = True
-                        self._events.put(("range", (part, ok, msg)))
+                        self._events.put(("range", (part, ok, msg, n, label, elapsed)))
                     else:
                         _, key, ok, msg = res
                         self._events.put(("done", (key, ok, msg)))
@@ -679,6 +751,13 @@ class App(tk.Tk):
         self.btn_start.config(state="normal")
         self.btn_cancel.config(state="disabled")
         self.title(_APP_TITLE)
+        self._progress_q = None
+        if self._manager is not None:
+            try:
+                self._manager.shutdown()
+            except Exception:
+                pass
+            self._manager = None
 
 
 def run_selftest():

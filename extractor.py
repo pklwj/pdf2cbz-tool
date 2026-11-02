@@ -14,12 +14,14 @@ from typing import Iterator, Tuple
 import pymupdf
 
 
-def iter_unique_images(pdf_path: str, start: int = 0, end: int = None) -> Iterator[Tuple[str, bytes]]:
+def iter_unique_images(pdf_path: str, start: int = 0, end: int = None,
+                       on_page=None) -> Iterator[Tuple[str, bytes]]:
     """按页面顺序流式产出 (扩展名, 原始字节)，同一张图只产出一次。
 
     只处理 [start, end) 页（end 省略即到末尾）。分段并行时每个进程给一段，
     各自 open 一次 PDF —— MuPDF 不支持跨线程共享文档。
     产出一张、调用方消费一张，因此峰值内存约等于单张图，与页数无关。
+    on_page(pno, total) 在每页的图片消费完时回调，用于上报进度。
     """
     seen_xref = set()
     seen_hash = set()
@@ -40,3 +42,5 @@ def iter_unique_images(pdf_path: str, start: int = 0, end: int = None) -> Iterat
                     continue
                 seen_hash.add(digest)
                 yield info["ext"], data
+            if on_page is not None:
+                on_page(pno, stop)

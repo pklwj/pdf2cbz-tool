@@ -83,10 +83,11 @@ def _add_image(z, fname, data, ext, sink=None):
             f.write(data)
 
 
-def build_cbz(pdf_path, cbz_path, image_sink=None):
+def build_cbz(pdf_path, cbz_path, image_sink=None, on_page=None):
     """把 PDF 内所有唯一图片打包成 cbz_path，返回写入的图片张数。
 
     image_sink 不为 None 时，每张图同时落盘到该目录（调用方负责清理）。
+    on_page 每页处理完回调一次，供上层上报进度。
     先写临时文件，全部成功后再 os.replace 原子换名：
     中途崩溃或中断只留 .part，不会产出半截还能打开的 CBZ。
     """
@@ -94,7 +95,7 @@ def build_cbz(pdf_path, cbz_path, image_sink=None):
     saved = 0
     try:
         with zipfile.ZipFile(tmp_cbz, "w", zipfile.ZIP_STORED) as z:
-            for ext, data in extractor.iter_unique_images(pdf_path):
+            for ext, data in extractor.iter_unique_images(pdf_path, on_page=on_page):
                 saved += 1
                 # 直写磁盘上的 .part：字节落盘后即可释放，峰值内存 = 单张图。
                 _add_image(z, f"img_{saved:03d}.{ext}", data, ext, image_sink)

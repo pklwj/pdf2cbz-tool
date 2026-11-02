@@ -158,6 +158,7 @@ def main_():
         "事件队列已排空": c["queued"] == 0,
         "Ctrl+A 全选": c["selected"] == 2,
         "无控件溢出": c["overflow"] == [],
+        "日志有页进度": "页（100%）" in c["log"],
         "日志含结束摘要": ("运行结束" in c["log"]) and ("成功 2" in c["log"]),
         "无异常栈": "Traceback" not in c["log"],
     })
@@ -177,6 +178,7 @@ def main_():
         "产物一个 CBZ": "Solo.cbz" in s["files"],
         "日志显示按页切段": "按页切" in s["log"] and "段并行" in s["log"],
         "日志显示合并": "合并中" in s["log"],
+        "日志有页段明细": "页段 1/" in s["log"] and " 张，" in s["log"],
         "状态回写": s["statuses"] == ["完成"],
         "进度按段计满": s["progress"][0] == s["progress"][1] and s["progress"][1] > 1,
         "无 .part 残留": not any(x.endswith(".part") for x in s["files"]),
