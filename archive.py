@@ -23,7 +23,7 @@ _ILLEGAL_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
 class NoImagesError(Exception):
-    """PDF 里一张图都没提取到（多半是纯文字 / 纯矢量 PDF，不是扫描件）。"""
+    """源文件里一张图都没提取到（纯文字 PDF，或 MOBI / EPUB 里没有图片资源）。"""
 
 
 def zip_compress_type(ext):
@@ -83,8 +83,8 @@ def _add_image(z, fname, data, ext, sink=None):
             f.write(data)
 
 
-def build_cbz(pdf_path, cbz_path, image_sink=None, on_page=None):
-    """把 PDF 内所有唯一图片打包成 cbz_path，返回写入的图片张数。
+def build_cbz(src_path, cbz_path, image_sink=None, on_page=None):
+    """把源文件（PDF / MOBI 家族）内所有唯一图片打包成 cbz_path，返回写入的张数。
 
     image_sink 不为 None 时，每张图同时落盘到该目录（调用方负责清理）。
     on_page 每页处理完回调一次，供上层上报进度。
@@ -95,12 +95,12 @@ def build_cbz(pdf_path, cbz_path, image_sink=None, on_page=None):
     saved = 0
     try:
         with zipfile.ZipFile(tmp_cbz, "w", zipfile.ZIP_STORED) as z:
-            for ext, data in extractor.iter_unique_images(pdf_path, on_page=on_page):
+            for ext, data in extractor.iter_unique_images(src_path, on_page=on_page):
                 saved += 1
                 # 直写磁盘上的 .part：字节落盘后即可释放，峰值内存 = 单张图。
                 _add_image(z, f"img_{saved:03d}.{ext}", data, ext, image_sink)
         if not saved:
-            raise NoImagesError(os.path.basename(pdf_path))
+            raise NoImagesError(os.path.basename(src_path))
         replace_with_retry(tmp_cbz, cbz_path)   # 原子换名；Windows 短暂占用会重试
         return saved
     finally:
@@ -111,15 +111,15 @@ def build_cbz(pdf_path, cbz_path, image_sink=None, on_page=None):
                 pass
 
 
-def write_part(pdf_path, part_file, start, end, image_sink=None):
-    """写一个页段的临时 zip（分段并行用），返回 (图片数, 字节数)。
+def write_part(src_path, part_file, start, end, image_sink=None):
+    """写一个页段 / 图片段的临时 zip（分段并行用），返回 (图片数, 字节数)。
 
     段内自己做 xref + 内容去重；跨段的重复由 merge_parts 再兜一次。
     """
     saved = 0
     total = 0
     with zipfile.ZipFile(part_file, "w", zipfile.ZIP_STORED) as z:
-        for ext, data in extractor.iter_unique_images(pdf_path, start, end):
+        for ext, data in extractor.iter_unique_images(src_path, start, end):
             saved += 1
             total += len(data)
             # 段内文件名无所谓，合并时统一重排成 img_%03d.ext

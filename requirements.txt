@@ -1,1 +1,4 @@
+# PDF 路径（MIT 项目本体）
 pymupdf>=1.24
+# MOBI 路径的容器解析（GPLv3，独立第三方库；不装则 MOBI 功能报错、PDF 功能照常）
+pymobi>=0.1.3

@@ -5,19 +5,20 @@ import difflib
 import os
 
 PROJ = os.path.dirname(os.path.abspath(__file__))
-MODULES = ("extractor.py", "archive.py", "batch.py", "rename.py", "main.py")
+MODULES = ("extractor.py", "pdf_images.py", "archive.py", "batch.py",
+           "rename.py", "main.py")
 
 RENAME = {
     "_nat_key": "nat_key", "_list_cbz": "list_cbz", "_safe_stem": "safe_stem",
     "_zip_compress_type": "zip_compress_type", "_cleanup_stale_tmp": "cleanup_stale_tmp",
     "_PRE_COMPRESSED_EXTS": "PRE_COMPRESSED_EXTS",
 }
-STRIP = ("rename.", "batch.", "archive.", "extractor.")
+STRIP = ("rename.", "batch.", "archive.", "extractor.", "pdf_images.")
 
 PAIRS = {
     "_safe_stem": "safe_stem", "_zip_compress_type": "zip_compress_type",
     "_list_cbz": "list_cbz", "_cleanup_stale_tmp": "cleanup_stale_tmp",
-    "scan_pdfs": "scan_pdfs", "convert_pdf_to_cbz": "convert_pdf_to_cbz",
+    "scan_pdfs": "scan_inputs", "convert_pdf_to_cbz": "convert_file",
     "extract_volume": "extract_volume", "_nat_key": "nat_key",
     "plan_renames": "plan_renames", "find_conflicts": "find_conflicts",
 }
@@ -25,7 +26,8 @@ PAIRS = {
 NOTE = {
     "_safe_stem": "非法字符正则提成模块级预编译常量 `_ILLEGAL_CHARS`，字符集与 strip 规则不变。",
     "_cleanup_stale_tmp": "`.part` 后缀判断改调 `archive.is_part_file()`——临时名里现在夹了 pid，原来的 `.cbz.part` 字面后缀匹配不上了。",
-    "convert_pdf_to_cbz": "提取循环搬去 `extractor.iter_unique_images()`，打包搬去 `archive.build_cbz()`。keep_images 搬家、原子换名、失败兜底三段原样保留，只把 `os.replace` 换成带重试的版本。",
+    "convert_pdf_to_cbz": "改名为 `convert_file` 并支持 MOBI：提取循环搬去 `extractor.iter_unique_images()`（内部按扩展名分派），打包搬去 `archive.build_cbz()`。keep_images 搬家、原子换名、失败兜底三段原样保留，只把 `os.replace` 换成带重试的版本。",
+    "scan_pdfs": "改名为 `scan_inputs`，扩展名从 `.pdf` 扩成 `SOURCE_EXTS`（PDF + MOBI 家族），递归与非递归两段结构不变。",
     "RenameDialog._refresh": "底部文案改走 `_update_lbl()`。原来是两处各写一遍同样的 if，加一个「跳过」按钮就得改两处。",
     "RenameDialog._do_rename": "两步改名 + 单文件回滚那一整段搬去 `rename.execute_renames()`，这里只剩参数校验、确认框、汇总消息。行为不变，差别是那段代码终于能被单测碰到。",
     "App.__init__": "加事件队列 `_events` 与 `_run_total`；并行度默认值从写死的 `\"6\"` 改为 `_default_workers()`（按 cpu_count()//2 落档位）。",
@@ -36,7 +38,12 @@ NOTE = {
 }
 
 ADDED = {
-    "iter_unique_images": "从 convert_pdf_to_cbz 里搬出来的提取循环，改成生成器，逐张 yield (ext, bytes)，峰值内存仍是一张图。",
+    "iter_unique_images": "从 convert_pdf_to_cbz 里搬出来的提取循环，改成生成器，逐张 yield (ext, bytes)，峰值内存仍是一张图。现在只剩分派：PDF 走 `pdf_images.iter_pdf_images`，MOBI 家族走 `mobi.iter_mobi_images`。",
+    "probe_pdf": "从 extractor.py 搬到 pdf_images.py，逻辑未改：只读 xref 扫 Filter 分布，不解码像素。",
+    "iter_pdf_images": "从 extractor.py 的 `_iter_pdf_images` 搬来并转公开（分派层要调它），xref + MD5 双层去重不变。",
+    "_sniff": "记录 → (扩展名, 干净字节)：按魔数判图，并裁掉记录尾部 NUL 填充（实测 200 张 JPEG 里 148 张有）。只裁 NUL，不动图像字节。",
+    "probe_mobi": "只读记录头不读整图，给出张数 / 编码分布 / 格式 / 是否 DRM，供转换前打印摘要。",
+    "iter_mobi_images": "MOBI 侧的提取生成器：合体书、KF8、MOBI6 都按记录嗅探，顺序即翻页顺序，MD5 去重，DRM 直接抛错。",
     "build_cbz": "从 convert_pdf_to_cbz 里搬出来的打包段：写 .part → 逐张选压缩方式 → 原子换名。返回图片张数，0 张抛 NoImagesError。",
     "part_path": "临时文件名改为 `<卷>.cbz.<pid>.part`。原先固定 `<卷>.cbz.part`，同名任务并发时共用同一文件，撞 WinError 32 双方全败。",
     "is_part_file": "识别带 pid 的 .part，供启动清理使用。",
@@ -92,7 +99,7 @@ def main():
             new[k] = v
             where[k] = ow[k]
 
-    same, changed, hunks = [], [], []
+    same, changed = [], []
     for old, target in PAIRS.items():
         cand = [k for k in new if k.split(".")[-1] == target]
         if not cand:
@@ -168,9 +175,13 @@ def main():
     w("")
     w("## 四、没有删除任何上游逻辑")
     w("")
-    w("上游每个函数都在新代码里有对应物：26 个原样搬走，10 个改了内部实现，没有丢弃任何一个。")
+    w("上游每个函数都在新代码里有对应物：%d 个原样搬走，%d 个改了内部实现，没有丢弃任何一个。"
+      % (len(same), len(changed)))
     w("`convert_pdf_to_cbz` 与 `_do_rename` 里被抽走的两段，分别落在 `archive.build_cbz` +")
     w("`extractor.iter_unique_images` 与 `rename.execute_renames`，逐行搬，没有重写。")
+    w("")
+    w("MOBI / AZW / AZW3 与 EPUB 支持、以及源文件体检，分别是新增模块 `mobi.py` / `epub.py` /")
+    w("`probe.py`，不属于上游对照范围——上游只有 PDF 路径。")
     w("")
     w("## 五、怎么自己验")
     w("")

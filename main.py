@@ -6,7 +6,11 @@
     PDF2CBZ.exe               # 或用打包好的单文件 exe
 
 其余模块职责：
-    extractor.py  PDF 内图片无损提取（xref + MD5 去重）
+    extractor.py  图片提取总入口（只做分派，不含实现）
+    pdf_images.py PDF 内嵌图片提取（xref + MD5 双层去重）
+    mobi.py       MOBI / AZW / AZW3 内嵌图片提取（容器解析走 pymobi）
+    epub.py       EPUB 内嵌图片提取（标准库解 ZIP + 按 spine 顺序取图）
+    probe.py      源文件体检（页数/张数/编码/能否切段），任务层只问它
     archive.py    CBZ 打包（按格式选压缩方式、原子写入）
     batch.py      批量转换（多进程 worker、目录扫描、残留清理）
     rename.py     批量重命名逻辑（卷号识别、计划、冲突检测）
@@ -24,10 +28,11 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import batch
+import probe
 import rename
 
 _LOG_MAX_LINES = 3000
-_APP_TITLE = "PDF 转 CBZ 漫画打包工具"
+_APP_TITLE = "PDF / MOBI / EPUB 转 CBZ 漫画打包工具"
 _WORKER_CHOICES = ("1", "2", "4", "6", "8")
 # 单文件低于这个页数就不切段：分段要付出一次合并开销（读+写一份完整副本）
 _SPLIT_MIN_PAGES = 40
@@ -252,12 +257,12 @@ class App(tk.Tk):
     def _build_ui(self):
         pad = {"padx": 8, "pady": 4}
 
-        frm_top = ttk.LabelFrame(self, text="1. 选择 PDF 文件（可多选 / 添加整个文件夹）")
+        frm_top = ttk.LabelFrame(self, text="1. 选择文件（PDF / MOBI / EPUB，可多选 / 添加整个文件夹）")
         frm_top.pack(fill="both", expand=True, **pad)
 
         btns = ttk.Frame(frm_top)
         btns.pack(fill="x", padx=8, pady=4)
-        ttk.Button(btns, text="添加 PDF…", command=self.add_files).pack(side="left")
+        ttk.Button(btns, text="添加文件…", command=self.add_files).pack(side="left")
         ttk.Button(btns, text="添加文件夹…", command=self.add_folder).pack(side="left", padx=6)
         ttk.Checkbutton(btns, text="含子文件夹", variable=self.recursive).pack(side="left", padx=4)
         ttk.Button(btns, text="移除选中", command=self.remove_selected).pack(side="left", padx=6)
@@ -335,17 +340,21 @@ class App(tk.Tk):
     # ---------- 文件列表 ----------
     def add_files(self):
         paths = filedialog.askopenfilenames(
-            title="选择 PDF",
-            filetypes=[("PDF 文件", "*.pdf"), ("所有文件", "*.*")])
+            title="选择文件",
+            filetypes=[("PDF 与电子书", "*.pdf *.mobi *.azw *.azw3 *.prc *.epub"),
+                       ("PDF 文件", "*.pdf"),
+                       ("MOBI / AZW 电子书", "*.mobi *.azw *.azw3 *.prc"),
+                       ("EPUB", "*.epub"),
+                       ("所有文件", "*.*")])
         self._add_paths(list(paths))
 
     def add_folder(self):
         d = filedialog.askdirectory(title="选择文件夹")
         if not d:
             return
-        found = batch.scan_pdfs(d, self.recursive.get())
+        found = batch.scan_inputs(d, self.recursive.get())
         if not found:
-            messagebox.showinfo("提示", "该文件夹下没有找到 PDF 文件")
+            messagebox.showinfo("提示", "该文件夹下没有找到 PDF / MOBI / EPUB 文件")
             return
         self._add_paths(found)
 
@@ -359,7 +368,7 @@ class App(tk.Tk):
                 added += 1
         if added and not self.out_dir.get() and paths:
             self.out_dir.set(os.path.dirname(paths[0]))
-        self.log_line(f"已添加 {added} 个 PDF（累计 {len(self.files)} 个）")
+        self.log_line(f"已添加 {added} 个文件（累计 {len(self.files)} 个）")
 
     def remove_selected(self):
         """按路径精确移除选中项。不用 tree.index 反查（多选删除时索引会前移导致删错）。"""
@@ -574,7 +583,7 @@ class App(tk.Tk):
             return
         todo = [f[0] for f in self.files if f[1] != "完成"]
         if not todo:
-            messagebox.showinfo("提示", "没有待转换的 PDF（已完成的不会重复转换）")
+            messagebox.showinfo("提示", "没有待转换的文件（已完成的不会重复转换）")
             return
         out_dir = self.out_dir.get().strip()
         if not out_dir:
@@ -587,11 +596,11 @@ class App(tk.Tk):
         # 同名不同目录的 PDF 会落到同一个 <卷名>.cbz，并行时互相覆盖 —— 先问一声
         collisions = batch.find_output_collisions(todo)
         if collisions:
-            preview = "\n".join(f"{name}  ← {len(ps)} 个 PDF" for name, ps in collisions[:5])
+            preview = "\n".join(f"{name}  ← {len(ps)} 个文件" for name, ps in collisions[:5])
             more = f"\n…另有 {len(collisions) - 5} 组" if len(collisions) > 5 else ""
             if not messagebox.askyesno(
                     "输出重名",
-                    f"有 {len(collisions)} 组 PDF 会写到同一个 CBZ（同名但不在同一目录）：\n"
+                    f"有 {len(collisions)} 组文件会写到同一个 CBZ（同名但不在同一目录）：\n"
                     f"{preview}{more}\n\n"
                     "转换时它们会互相覆盖，最终只留最后完成的那个。要继续吗？"):
                 return
@@ -608,8 +617,8 @@ class App(tk.Tk):
         # 单文件 + 多核：任务粒度是「一个文件一个进程」，不切段就只有 1 个核在跑。
         # 页数够多才值得切（切段要多一次合并，小文件不划算）。
         split = None
-        if len(todo) == 1 and n_workers > 1:
-            pages = batch.count_pages(todo[0])
+        if len(todo) == 1 and n_workers > 1 and probe.can_split(todo[0]):
+            pages = probe.image_count(todo[0])
             vol = os.path.splitext(os.path.basename(todo[0]))[0]
             if pages >= _SPLIT_MIN_PAGES and (ove or not os.path.exists(os.path.join(out_dir, vol + ".cbz"))):
                 split = (todo[0], pages, vol)
@@ -634,7 +643,7 @@ class App(tk.Tk):
                       for s in range(0, pages, step)]
         else:
             # 任务键用文件路径（唯一），而非序号 —— 序号在过滤后会错位。
-            params = [batch.ConvertJob(pdf_path=p, out_dir=out_dir, keep_images=keep,
+            params = [batch.ConvertJob(src_path=p, out_dir=out_dir, keep_images=keep,
                                        overwrite=ove, progress=self._progress_q) for p in todo]
 
         self.running = True
@@ -659,7 +668,7 @@ class App(tk.Tk):
         # 图片编码探测：只读 xref 不解码，约 0.3 ms/页。文件多时只探前若干个，
         # 免得转换还没开始就先卡住界面。
         for p in todo[:_PROBE_LIMIT]:
-            self.log_line(batch.probe_summary(p))
+            self.log_line(probe.summary(p))
         if len(todo) > _PROBE_LIMIT:
             self.log_line(f"  （文件较多，编码探测只覆盖前 {_PROBE_LIMIT} 个）")
         if split:
@@ -783,7 +792,7 @@ class App(tk.Tk):
 
 
 def run_selftest():
-    """无界面自检：验证打包成 exe 后 PyMuPDF 与多进程 Pool 仍可用。
+    """无界面自检：验证打包成 exe 后 PyMuPDF、多进程、MOBI/EPUB 三条路径仍可用。
 
     窗口模式（--windowed）没有 stdout，结果写 %TEMP%\\pdf2cbz_selftest.txt，
     退出码 0 = 通过。用法：PDF2CBZ.exe --selftest
@@ -810,7 +819,7 @@ def run_selftest():
         os.makedirs(out)
         with multiprocessing.Pool(2) as pool:
             res = list(pool.imap_unordered(
-                batch.convert_pdf_to_cbz, [batch.ConvertJob(src, out, False, False)]))
+                batch.convert_file, [batch.ConvertJob(src, out, False, False)]))
         path, success, msg = res[0]
         lines.append(f"转换: ok={success} msg={msg}")
         cbz = os.path.join(out, "Vol 01.cbz")
@@ -826,8 +835,84 @@ def run_selftest():
         n_split = archive.merge_parts([pa, pb], os.path.join(out, "split.cbz"))
         lines.append(f"分段合并条目数: {n_split}")
         lines.append(f"PyMuPDF: {pymupdf.__version__ if hasattr(pymupdf, '__version__') else pymupdf.version}")
+
+        # MOBI / EPUB 是后加的两条路径：pymobi 在函数内按需导入，打包最容易漏。
+        # 这里真的转一本最小 EPUB，并确认 pymobi 能 import —— 否则 exe 会「PDF 能用、MOBI 不能用」。
+        import epub
+        import mobi
+        import pymobi
+        lines.append(f"格式模块: epub={epub.is_epub('x.epub')} "
+                     f"mobi={mobi.is_mobi('x.mobi')} pymobi={pymobi.__version__}")
+
+        png = pymupdf.Pixmap(pymupdf.csRGB, 40, 40, bytes((9, 120, 200)) * 1600, 0).tobytes("png")
+        epub_src = os.path.join(tmp, "Vol 02.epub")
+        with zipfile.ZipFile(epub_src, "w") as z:
+            z.writestr("META-INF/container.xml",
+                       '<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+                       '<rootfiles><rootfile full-path="OEBPS/c.opf"/></rootfiles></container>')
+            z.writestr("OEBPS/c.opf",
+                       '<package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata/>'
+                       '<manifest>'
+                       '<item id="p1" href="t1.xhtml" media-type="application/xhtml+xml"/>'
+                       '<item id="p2" href="t2.xhtml" media-type="application/xhtml+xml"/>'
+                       '<item id="i1" href="a.png" media-type="image/png"/>'
+                       '<item id="i2" href="b.png" media-type="image/png"/>'
+                       '<item id="i3" href="c.png" media-type="image/png"/>'
+                       '</manifest><spine><itemref idref="p1"/><itemref idref="p2"/>'
+                       '</spine></package>')
+            for i, img in ((1, "a.png"), (2, "b.png")):
+                z.writestr(f"OEBPS/t{i}.xhtml",
+                           '<html xmlns="http://www.w3.org/1999/xhtml"><body>'
+                           f'<img src="{img}"/></body></html>')
+            for name in ("a.png", "b.png", "c.png"):     # c.png 只在 manifest，测补漏
+                z.writestr(f"OEBPS/{name}", png)
+
+        _pe, ok_e, msg_e = batch.convert_file(batch.ConvertJob(epub_src, out, False, False))
+        n_epub = len(zipfile.ZipFile(os.path.join(out, "Vol 02.cbz")).infolist()) \
+            if os.path.exists(os.path.join(out, "Vol 02.cbz")) else -1
+        lines.append(f"EPUB 转换: ok={ok_e} 条目={n_epub} msg={msg_e}")
+
+        # 最小 MOBI（无 EXTH）：PalmDB 头 + 记录表 + 记录 0（PalmDOC 16B + MOBI 头）+ 1 张图。
+        # 只为证明「pymobi 打开了真书、嗅探到图、能打出 CBZ」在冻结环境里成立。
+        import struct
+        mobi_src = os.path.join(tmp, "Vol 03.mobi")
+        r0 = bytearray(16 + 0xE8)
+        struct.pack_into(">H", r0, 0, 1)              # 不压缩
+        r0[0x10:0x14] = b"MOBI"
+        struct.pack_into(">L", r0, 0x14, 0xE8)        # MOBI 头长度
+        struct.pack_into(">L", r0, 0x18, 2)           # 类型：书
+        struct.pack_into(">L", r0, 0x1C, 65001)       # UTF-8
+        struct.pack_into(">L", r0, 0x24, 6)           # fileVersion
+        struct.pack_into(">L", r0, 0x50, 2)           # 首条非正文记录
+        struct.pack_into(">L", r0, 0x5C, 1033)        # locale
+        struct.pack_into(">L", r0, 0x68, 6)           # minVersion
+        struct.pack_into(">L", r0, 0x6C, 3)           # 首条图片记录
+        struct.pack_into(">L", r0, 0x80, 0)           # 无 EXTH
+        struct.pack_into(">L", r0, 0xA8, 0xFFFFFFFF)  # 无 DRM
+        struct.pack_into(">L", r0, 0xAC, 0xFFFFFFFF)
+        struct.pack_into(">H", r0, 0xC2, 3)           # 末条记录号
+        # pymobi 会读到记录 0 偏移 248 的字段，头部正好 248 字节时要留余量
+        recs = [bytes(r0) + b"\x00" * 8, b"<html>a</html>", b"<html>b</html>", png]
+        pdb = bytearray(78)
+        pdb[0:8] = b"Selftest"
+        pdb[60:64], pdb[64:68] = b"BOOK", b"MOBI"
+        struct.pack_into(">H", pdb, 76, len(recs))
+        table = bytearray(len(recs) * 8)
+        off = 78 + len(table)
+        for i, rec in enumerate(recs):
+            struct.pack_into(">L", table, i * 8, off)
+            off += len(rec)
+        with open(mobi_src, "wb") as f:
+            f.write(bytes(pdb) + bytes(table) + b"".join(recs))
+
+        _pm, ok_m, msg_m = batch.convert_file(batch.ConvertJob(mobi_src, out, False, False))
+        n_mobi = len(zipfile.ZipFile(os.path.join(out, "Vol 03.cbz")).infolist()) \
+            if os.path.exists(os.path.join(out, "Vol 03.cbz")) else -1
+        lines.append(f"MOBI 转换: ok={ok_m} 条目={n_mobi} msg={msg_m}")
+
         lines.append(f"frozen: {getattr(sys, 'frozen', False)}")
-        ok = bool(success) and n == 3 and n_split == 3
+        ok = bool(success) and n == 3 and n_split == 3 and ok_e and n_epub == 3 \
+            and ok_m and n_mobi == 1
     except Exception:
         lines.append(traceback.format_exc())
     lines.append("RESULT: " + ("PASS" if ok else "FAIL"))

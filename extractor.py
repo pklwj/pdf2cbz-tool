@@ -1,76 +1,30 @@
 # -*- coding: utf-8 -*-
-"""PDF 图片提取。
+"""图片提取总入口：只做分派，不含任何提取实现。
 
-doc.extract_image() 直接返回 PDF 内嵌图片的原始编码字节 —— 不重编码、不重采样、
-不改色彩空间，所以产物与源 PDF 里的图完全一致。
+三个实现平级，各自可独立测试：
+    pdf_images.py   PDF —— PyMuPDF 按 xref 直取原始字节
+    mobi.py         MOBI / AZW / AZW3 —— pymobi 解容器 + 逐记录嗅探
+    epub.py         EPUB —— 标准库解 ZIP + 按 spine 阅读顺序取图
 
-去重做两层：
-  1) xref 级：同一图片对象被多页复用时 xref 相同，只取一次；
-  2) 内容级：不同 xref 但字节完全相同的图（有些 PDF 会重复嵌入），MD5 兜住。
+两者契约一致：流式产出 (扩展名, 原始字节)，同一张图只产出一次，峰值内存约一张图。
+调用方向保持单向：archive → extractor → {pdf_images, mobi, epub}，没有反向依赖。
 """
-import hashlib
-from collections import Counter
 from typing import Iterator, Tuple
 
-import pymupdf
-
-# Filter 名里没有 `/Filter` 键的裸位图，统一记成这个名字
-UNCOMPRESSED = "未压缩"
-
-
-def probe_pdf(pdf_path: str):
-    """只读 xref 扫图片编码，不解码任何一个像素。
-
-    返回 (页数, 唯一图片数, Counter{编码名: 张数})。
-    Filter 可能是数组（如 `/Filter [/FlateDecode]`），逐个 token 计入。
-    实测 200 页 / 883 MB 的 PDF 只要 53 ms，可以放在转换前同步跑。
-    """
-    dist = Counter()
-    seen = set()
-    with pymupdf.open(pdf_path) as doc:
-        pages = doc.page_count
-        for page in doc:
-            for img in page.get_images(full=True):
-                xref = img[0]
-                if xref in seen:
-                    continue
-                seen.add(xref)
-                kind, val = doc.xref_get_key(xref, "Filter")
-                if kind == "null":
-                    dist[UNCOMPRESSED] += 1
-                else:
-                    for tok in val.strip("[]").split():
-                        dist[tok.lstrip("/")] += 1
-    return pages, len(seen), dist
+import epub
+import mobi
+import pdf_images
 
 
-def iter_unique_images(pdf_path: str, start: int = 0, end: int = None,
+def iter_unique_images(path: str, start: int = 0, end: int = None,
                        on_page=None) -> Iterator[Tuple[str, bytes]]:
-    """按页面顺序流式产出 (扩展名, 原始字节)，同一张图只产出一次。
+    """按扩展名分派到具体实现。
 
-    只处理 [start, end) 页（end 省略即到末尾）。分段并行时每个进程给一段，
-    各自 open 一次 PDF —— MuPDF 不支持跨线程共享文档。
-    产出一张、调用方消费一张，因此峰值内存约等于单张图，与页数无关。
-    on_page(pno, total) 在每页的图片消费完时回调，用于上报进度。
+    start/end 对 PDF 是页号区间，对 MOBI 是图片序号区间；end 省略即到末尾。
+    上层（archive / 分段 worker）只认这个函数，不必关心源文件是哪种格式。
     """
-    seen_xref = set()
-    seen_hash = set()
-    with pymupdf.open(pdf_path) as doc:
-        stop = doc.page_count if end is None else min(end, doc.page_count)
-        for pno in range(max(0, start), stop):
-            page = doc[pno]
-            # full=True 才带 xref；get_images() 只给序号，无法做对象级去重。
-            for img in page.get_images(full=True):
-                xref = img[0]
-                if xref in seen_xref:
-                    continue
-                seen_xref.add(xref)
-                info = doc.extract_image(xref)
-                data = info["image"]
-                digest = hashlib.md5(data).hexdigest()
-                if digest in seen_hash:
-                    continue
-                seen_hash.add(digest)
-                yield info["ext"], data
-            if on_page is not None:
-                on_page(pno, stop)
+    if mobi.is_mobi(path):
+        return mobi.iter_mobi_images(path, start, end, on_page)
+    if epub.is_epub(path):
+        return epub.iter_epub_images(path, start, end, on_page)
+    return pdf_images.iter_pdf_images(path, start, end, on_page)

@@ -6,7 +6,8 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    # pymobi 在 mobi.py 里是函数内按需导入，静态分析可能漏掉，显式带上
+    hiddenimports=['pymobi', 'pymobi.mobi', 'pymobi.util', 'pymobi.compression'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

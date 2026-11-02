@@ -2,7 +2,8 @@
 """批量转换：任务参数、单文件 worker、目录扫描、崩溃残留清理。
 
 worker 必须是模块级函数、入参必须可 pickle —— multiprocessing 靠 pickle 传参。
-PyMuPDF 底层 MuPDF 不保证线程安全，所以并行只能走多进程（每进程独立开 PDF）。
+PyMuPDF 底层 MuPDF 不保证线程安全，所以并行只能走多进程（每进程独立开文件）。
+MOBI 解析（pymobi）同理：每个 worker 各自开一本，不共享句柄。
 """
 import os
 import shutil
@@ -10,48 +11,19 @@ import time
 import traceback
 from collections import namedtuple
 
-import pymupdf
-
 import archive
-import extractor
+import probe
+
+# 可转换的源文件清单由 probe 统一维护（PDF / MOBI 家族 / EPUB）
+SOURCE_EXTS = probe.SOURCE_EXTS
 
 # 转换任务参数：用具名元组替代裸元组，避免位置传参错位，且可被 pickle。
 # progress 是 Manager().Queue() 的代理，worker 往里丢 (标签, 已处理页, 总页数)；
 # 不需要进度时留 None（旧的四参调用保持可用）。
-ConvertJob = namedtuple("ConvertJob", "pdf_path out_dir keep_images overwrite progress",
+ConvertJob = namedtuple("ConvertJob", "src_path out_dir keep_images overwrite progress",
                         defaults=(None,))
 # 页段任务：单文件吃多核用。一整册按页切段，各段写自己的临时 zip，最后合并。
-RangeJob = namedtuple("RangeJob", "pdf_path part start end")
-
-# 编码 → (处理方式, 快慢)。判断依据是 PyMuPDF 能不能直接给出原始字节：
-# DCT/JPX/JBIG2/CCITT 都是成品压缩流，取出来就是合法图片；Flate 与裸位图要重新编码。
-_FILTER_HINT = {
-    "DCTDecode": ("JPEG 字节直拷", "快"),
-    "JPXDecode": ("JPEG2000 字节直拷", "快"),
-    "JBIG2Decode": ("JBIG2 字节直拷", "快"),
-    "CCITTFaxDecode": ("CCITT 字节直拷", "快"),
-    "FlateDecode": ("解压后重编码 PNG", "慢"),
-    "未压缩": ("裸位图，需编码 PNG", "慢"),
-}
-
-
-def probe_summary(pdf_path):
-    """一行日志用的摘要：页数 / 图片数 / 编码分布 / 快慢判断。"""
-    name = os.path.basename(pdf_path)
-    try:
-        pages, total, dist = extractor.probe_pdf(pdf_path)
-    except Exception as e:
-        return f"  {name}：读取失败（{e}），转换大概率也会失败"
-    head = f"  {name}：{pages} 页，{total} 张图"
-    if not total:
-        return head + " → 未检测到图片，转换会失败（只支持图片型 PDF）"
-    top = dist.most_common(3)
-    shown = " / ".join(f"{k} {v}" for k, v in top)
-    if len(dist) > 3:
-        shown += f" / 另 {len(dist) - 3} 种"
-    action, speed = _FILTER_HINT.get(top[0][0], ("未知编码", "未知"))
-    return f"{head} · {shown} → 多数 {top[0][0]}，{action}，{speed}"
-
+RangeJob = namedtuple("RangeJob", "src_path part start end")
 
 def _throttled_page_cb(q, label, interval=0.4):
     """页进度回调：限流后再塞进队列，避免每页都跨进程通信把日志冲爆。"""
@@ -69,31 +41,32 @@ def _throttled_page_cb(q, label, interval=0.4):
     return cb
 
 
-def scan_pdfs(folder, recursive=False):
-    """扫描 PDF。递归与非递归行为一致：大小写不敏感（.pdf / .PDF 都收）。"""
+def scan_inputs(folder, recursive=False):
+    """扫描可转换文件（PDF / MOBI / AZW / AZW3 / PRC / EPUB）。递归与非递归行为一致：
+    大小写不敏感（.pdf / .PDF 都收）。"""
     result = []
     if recursive:
         for root, _, files in os.walk(folder):
             for f in files:
-                if f.lower().endswith(".pdf"):
+                if f.lower().endswith(SOURCE_EXTS):
                     result.append(os.path.join(root, f))
     else:
         for entry in os.scandir(folder):
-            if entry.is_file() and entry.name.lower().endswith(".pdf"):
+            if entry.is_file() and entry.name.lower().endswith(SOURCE_EXTS):
                 result.append(entry.path)
     return sorted(result)
 
 
-def find_output_collisions(pdf_paths):
-    """找出会写到同一个 <卷名>.cbz 的 PDF 组。
+def find_output_collisions(sources):
+    """找出会写到同一个 <卷名>.cbz 的源文件组。
 
-    不同目录下的同名 PDF（如两套书都叫 Vol 01.pdf）落到同一输出目录时，
-    后完成的会覆盖先完成的，且预览里看不出来。返回 [(输出文件名, [pdf...])]，
+    不同目录下的同名文件（如两套书都叫 Vol 01.pdf）落到同一输出目录时，
+    后完成的会覆盖先完成的，且预览里看不出来。返回 [(输出文件名, [源文件...])]，
     只含真正冲突的组；组内保持输入顺序。
     """
     groups = {}
     order = []
-    for p in pdf_paths:
+    for p in sources:
         vol = os.path.splitext(os.path.basename(p))[0]
         name = vol + ".cbz"
         key = name.lower()          # Windows 文件系统大小写不敏感
@@ -124,23 +97,23 @@ def cleanup_stale_tmp(out_dir):
         pass
 
 
-def convert_pdf_to_cbz(job):
-    """转换单个 PDF（多进程 worker）。入参为 ConvertJob（可 pickle）。
-    返回 (pdf_path, 是否成功, 消息)。用路径而非序号回写状态，避免顺序错位。
+def convert_file(job):
+    """转换单个文件（PDF / MOBI / EPUB，多进程 worker）。入参为 ConvertJob（可 pickle）。
+    返回 (src_path, 是否成功, 消息)。用路径而非序号回写状态，避免顺序错位。
 
     keep_images=False：流式直写 zip（单张图片进内存，写完即释放，零临时文件）。
-    keep_images=True：提取到系统 temp 的唯一目录（并行 worker 互不干扰），
+    keep_images=True：提取到输出目录下的临时目录（并行 worker 互不干扰），
     打包完成后原子移入输出目录的 <卷名>_images\\。"""
-    pdf_path = job.pdf_path
+    src_path = job.src_path
     out_dir = job.out_dir
     keep_images = job.keep_images
     overwrite = job.overwrite
-    base = os.path.basename(pdf_path)
+    base = os.path.basename(src_path)
     vol = os.path.splitext(base)[0]
     cbz = os.path.join(out_dir, vol + ".cbz")
 
     if os.path.exists(cbz) and not overwrite:
-        return pdf_path, False, f"跳过：{vol}.cbz 已存在（勾选“覆盖”可重做）"
+        return src_path, False, f"跳过：{vol}.cbz 已存在（勾选“覆盖”可重做）"
 
     work = None
     if keep_images:
@@ -153,18 +126,18 @@ def convert_pdf_to_cbz(job):
     on_page = _throttled_page_cb(progress, vol) if progress is not None else None
     try:
         try:
-            saved = archive.build_cbz(pdf_path, cbz, image_sink=work, on_page=on_page)
+            saved = archive.build_cbz(src_path, cbz, image_sink=work, on_page=on_page)
         except archive.NoImagesError:
-            return pdf_path, False, f"失败：{base} 未提取到任何图片"
+            return src_path, False, f"失败：{base} 未提取到任何图片"
 
         size_mb = os.path.getsize(cbz) / 1024 / 1024
         note = f"{saved} 张唯一图片，{size_mb:.1f} MB"
         if keep_images:
             note += _install_images(work, out_dir, vol)
             work = None     # 已移走或已暂存，都不再由本进程清理
-        return pdf_path, True, f"完成：{vol}.cbz（{note}）"
+        return src_path, True, f"完成：{vol}.cbz（{note}）"
     except Exception as e:
-        return pdf_path, False, f"失败：{base}：{e}\n{traceback.format_exc()}"
+        return src_path, False, f"失败：{base}：{e}\n{traceback.format_exc()}"
     finally:
         # work 为 None（已移走）或 keep_images=False（本来就是 None）时不清理
         if work is not None:
@@ -199,15 +172,6 @@ def _install_images(work, out_dir, vol):
             return f"；图片目录更名失败（{e}），图片残留在 {where}"
 
 
-def count_pages(pdf_path):
-    """页数。读不出来返回 0，交给调用方按「不分段」处理。"""
-    try:
-        with pymupdf.open(pdf_path) as doc:
-            return doc.page_count
-    except Exception:
-        return 0
-
-
 def convert_range(job):
     """页段 worker：把 [start, end) 页写成临时 zip。
 
@@ -216,7 +180,7 @@ def convert_range(job):
     t0 = time.time()
     label = f"第 {job.start + 1}–{job.end} 页"
     try:
-        n, _ = archive.write_part(job.pdf_path, job.part, job.start, job.end)
+        n, _ = archive.write_part(job.src_path, job.part, job.start, job.end)
     except Exception as e:
         return job.part, False, f"{e}\n{traceback.format_exc()}", 0, label, 0.0
     if not n:
@@ -231,12 +195,12 @@ def run_job(job):
     """
     if isinstance(job, RangeJob):
         return ("range",) + convert_range(job)
-    return ("file",) + convert_pdf_to_cbz(job)
+    return ("file",) + convert_file(job)
 
 
-def merge_ranges(pdf_path, out_dir, vol, parts, keep_images):
-    """合并页段并收尾，返回与 convert_pdf_to_cbz 同形的 (路径, 是否成功, 消息)。"""
-    base = os.path.basename(pdf_path)
+def merge_ranges(src_path, out_dir, vol, parts, keep_images):
+    """合并页段并收尾，返回与 convert_file 同形的 (路径, 是否成功, 消息)。"""
+    base = os.path.basename(src_path)
     cbz = os.path.join(out_dir, vol + ".cbz")
     work = None
     if keep_images:
@@ -250,11 +214,11 @@ def merge_ranges(pdf_path, out_dir, vol, parts, keep_images):
         if keep_images:
             note += _install_images(work, out_dir, vol)
             work = None
-        return pdf_path, True, f"完成：{vol}.cbz（{note}）"
+        return src_path, True, f"完成：{vol}.cbz（{note}）"
     except archive.NoImagesError:
-        return pdf_path, False, f"失败：{base} 未提取到任何图片"
+        return src_path, False, f"失败：{base} 未提取到任何图片"
     except Exception as e:
-        return pdf_path, False, f"失败：{base}：{e}\n{traceback.format_exc()}"
+        return src_path, False, f"失败：{base}：{e}\n{traceback.format_exc()}"
     finally:
         if work is not None:
             shutil.rmtree(work, ignore_errors=True)

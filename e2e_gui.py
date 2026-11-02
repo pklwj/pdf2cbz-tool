@@ -147,6 +147,44 @@ def scenario_cancel():
     return out
 
 
+def scenario_mobi():
+    """MOBI 输入走完整 GUI 流程：探测行 → 进度 → CBZ 产物。"""
+    import selftest as st
+
+    tmp = tempfile.mkdtemp(prefix="gui_e2e_mobi_")
+    indir = os.path.join(tmp, "in")
+    outdir = os.path.join(tmp, "out")
+    os.makedirs(indir)
+    os.makedirs(outdir)
+    src = os.path.join(indir, "Vol 09.mobi")
+    # 3 张正文图 + 1 张缩略图（EXTH 202 指的最后一条），末条带 NUL 填充
+    st.make_mobi(src,
+                 [st.make_pix((200, 60, 40), "jpg", 120, 160),
+                  st.make_pix((30, 120, 200), "png", 120, 160),
+                  st.gif_1px(),
+                  st.make_pix((90, 90, 90), "jpg", 40, 40)],
+                 thumb=3, pad_last=2)
+
+    app = main.App()
+    app.files = [[src, ""]]
+    app.tree.insert("", "end", values=(os.path.basename(src), src, ""))
+    app.out_dir.set(outdir)
+    out = {}
+    app.after(0, app.start)
+
+    def poll():
+        if app.running:
+            app.after(50, poll)
+        else:
+            out.update(collect(app, outdir))
+            app.destroy()
+
+    app.after(120, poll)
+    app.after(60000, lambda: app.destroy() if app.running else None)
+    app.mainloop()
+    return out
+
+
 def report(name, conds):
     bad = [k for k, v in conds.items() if not v]
     print(("PASS  " if not bad else "FAIL  ") + name + ("" if not bad else "  <- " + ", ".join(bad)))
@@ -198,6 +236,18 @@ def main_():
         "进度按段计满": s["progress"][0] == s["progress"][1] and s["progress"][1] > 1,
         "无 .part 残留": not any(x.endswith(".part") for x in s["files"]),
         "无异常栈": "Traceback" not in s["log"],
+    })
+
+    m = scenario_mobi()
+    ok &= report("MOBI 输入", {
+        "产物一个 CBZ": "Vol 09.cbz" in m["files"],
+        "状态回写": m["statuses"] == ["完成"],
+        "日志报出 MOBI 格式": "MOBI6" in m["log"],
+        "日志报出字节直拷": "字节直拷" in m["log"],
+        "日志张数正确（缩略图已丢）": "3 张唯一图片" in m["log"],
+        "MOBI 不切段": "按页切" not in m["log"],
+        "无 .part 残留": not any(x.endswith(".part") for x in m["files"]),
+        "无异常栈": "Traceback" not in m["log"],
     })
 
     print("\nE2E", "PASS" if ok else "FAIL")

@@ -9,17 +9,17 @@
 | 项 | 数量 |
 |---|---|
 | 上游函数/方法 | 36 |
-| 逐字未改（只换了所在模块） | 25 |
-| 有实质改动 | 11 |
-| 新增函数/方法 | 28 |
+| 逐字未改（只换了所在模块） | 21 |
+| 有实质改动 | 15 |
+| 新增函数/方法 | 27 |
 
 ## 一、逐字未改（只换了文件）
 
-`_zip_compress_type`、`_list_cbz`、`scan_pdfs`、`extract_volume`、`_nat_key`、`plan_renames`、`find_conflicts`、`App._add_paths`、`App._log_to_file`、`App._on_close`、`App._on_run_end`、`App._set_status_by_path`、`App.add_files`、`App.add_folder`、`App.browse_out`、`App.cancel`、`App.clear_files`、`App.open_rename`、`App.remove_selected`、`RenameDialog.__init__`、`RenameDialog._browse`、`RenameDialog._restore_selected`、`RenameDialog._skip_selected`、`RenameDialog._toggle_skip`、`RenameDialog._update_lbl`
+`_zip_compress_type`、`_list_cbz`、`extract_volume`、`_nat_key`、`plan_renames`、`find_conflicts`、`App._log_to_file`、`App._on_close`、`App._on_run_end`、`App._set_status_by_path`、`App.browse_out`、`App.cancel`、`App.clear_files`、`App.open_rename`、`App.remove_selected`、`RenameDialog.__init__`、`RenameDialog._browse`、`RenameDialog._restore_selected`、`RenameDialog._skip_selected`、`RenameDialog._toggle_skip`、`RenameDialog._update_lbl`
 
-这 25 个函数/方法的函数体与上游完全一致，拆分只改变了它们所在的文件。
+这 21 个函数/方法的函数体与上游完全一致，拆分只改变了它们所在的文件。
 
-## 二、有实质改动（11 处）
+## 二、有实质改动（15 处）
 
 ### `_safe_stem` → `archive.py:35`
 
@@ -34,13 +34,13 @@
      return stem or "untitled"
 ```
 
-### `_cleanup_stale_tmp` → `batch.py:107`
+### `_cleanup_stale_tmp` → `batch.py:80`
 
 `.part` 后缀判断改调 `archive.is_part_file()`——临时名里现在夹了 pid，原来的 `.cbz.part` 字面后缀匹配不上了。
 
 ```diff
 --- upstream:_cleanup_stale_tmp
-+++ batch.py:107
++++ batch.py:80
 @@ -3,5 +3,5 @@
              if name.startswith(".tmp_") or (
                      name.startswith(".__rn_") and name.endswith(".tmp")) or (
@@ -50,17 +50,27 @@
                  try:
 ```
 
-### `convert_pdf_to_cbz` → `batch.py:127`
+### `convert_pdf_to_cbz` → `batch.py:100`
 
-提取循环搬去 `extractor.iter_unique_images()`，打包搬去 `archive.build_cbz()`。keep_images 搬家、原子换名、失败兜底三段原样保留，只把 `os.replace` 换成带重试的版本。
+改名为 `convert_file` 并支持 MOBI：提取循环搬去 `extractor.iter_unique_images()`（内部按扩展名分派），打包搬去 `archive.build_cbz()`。keep_images 搬家、原子换名、失败兜底三段原样保留，只把 `os.replace` 换成带重试的版本。
 
 ```diff
 --- upstream:convert_pdf_to_cbz
-+++ batch.py:127
-@@ -8,71 +8,23 @@
++++ batch.py:100
+@@ -1,81 +1,33 @@
+-    pdf_path = job.pdf_path
++    src_path = job.src_path
+     out_dir = job.out_dir
+     keep_images = job.keep_images
+     overwrite = job.overwrite
+-    base = os.path.basename(pdf_path)
++    base = os.path.basename(src_path)
+     vol = os.path.splitext(base)[0]
+     cbz = os.path.join(out_dir, vol + ".cbz")
      if os.path.exists(cbz) and not overwrite:
-         return pdf_path, False, f"跳过：{vol}.cbz 已存在（勾选“覆盖”可重做）"
+-        return pdf_path, False, f"跳过：{vol}.cbz 已存在（勾选“覆盖”可重做）"
 -    work = tempfile.mkdtemp(prefix=f"pdf2cbz_{os.getpid()}_") if keep_images else None
++        return src_path, False, f"跳过：{vol}.cbz 已存在（勾选“覆盖”可重做）"
 +    work = None
 +    if keep_images:
 +        # 放输出目录而不是系统 temp：①同盘移动免拷贝；②子进程被终止时也落在
@@ -107,9 +117,9 @@
 -                    os.remove(tmp_cbz)
 -                except OSError:
 -                    pass
-+            saved = build_cbz(pdf_path, cbz, image_sink=work, on_page=on_page)
++            saved = build_cbz(src_path, cbz, image_sink=work, on_page=on_page)
 +        except NoImagesError:
-+            return pdf_path, False, f"失败：{base} 未提取到任何图片"
++            return src_path, False, f"失败：{base} 未提取到任何图片"
          size_mb = os.path.getsize(cbz) / 1024 / 1024
          note = f"{saved} 张唯一图片，{size_mb:.1f} MB"
          if keep_images:
@@ -139,19 +149,24 @@
 -                except OSError:
 -                    note += f"；图片目录更名失败（{e}），图片残留在 {where}"
 -                work = None     # 无论落在哪，都别再被 finally 删掉
+-        return pdf_path, True, f"完成：{vol}.cbz（{note}）"
 +            note += _install_images(work, out_dir, vol)
 +            work = None     # 已移走或已暂存，都不再由本进程清理
-         return pdf_path, True, f"完成：{vol}.cbz（{note}）"
++        return src_path, True, f"完成：{vol}.cbz（{note}）"
      except Exception as e:
+-        return pdf_path, False, f"失败：{base}：{e}\n{traceback.format_exc()}"
++        return src_path, False, f"失败：{base}：{e}\n{traceback.format_exc()}"
+     finally:
+         # work 为 None（已移走）或 keep_images=False（本来就是 None）时不清理
 ```
 
-### `RenameDialog._refresh` → `main.py:107`
+### `RenameDialog._refresh` → `main.py:112`
 
 底部文案改走 `_update_lbl()`。原来是两处各写一遍同样的 if，加一个「跳过」按钮就得改两处。
 
 ```diff
 --- upstream:RenameDialog._refresh
-+++ main.py:107
++++ main.py:112
 @@ -22,6 +22,3 @@
              else:
                  self.tree.insert("", "end", values=("执行", old, new))
@@ -162,13 +177,13 @@
 +        self._update_lbl()
 ```
 
-### `RenameDialog._do_rename` → `main.py:175`
+### `RenameDialog._do_rename` → `main.py:180`
 
 两步改名 + 单文件回滚那一整段搬去 `rename.execute_renames()`，这里只剩参数校验、确认框、汇总消息。行为不变，差别是那段代码终于能被单测碰到。
 
 ```diff
 --- upstream:RenameDialog._do_rename
-+++ main.py:175
++++ main.py:180
 @@ -4,5 +4,5 @@
              return
          plan = plan_renames(folder, self.prefix_var.get().strip(),
@@ -209,13 +224,13 @@
          if self.skipped:
 ```
 
-### `App.__init__` → `main.py:221`
+### `App.__init__` → `main.py:226`
 
 加事件队列 `_events` 与 `_run_total`；并行度默认值从写死的 `"6"` 改为 `_default_workers()`（按 cpu_count()//2 落档位）。
 
 ```diff
 --- upstream:App.__init__
-+++ main.py:221
++++ main.py:226
 @@ -1,12 +1,12 @@
          super().__init__()
 -        self.title("PDF 转 CBZ 漫画打包工具")
@@ -246,13 +261,24 @@
          self._state_lock = threading.Lock()
 ```
 
-### `App._build_ui` → `main.py:252`
+### `App._build_ui` → `main.py:257`
 
 标题常量化；「并行任务数」从复选框行挪到输出目录行（原位置在 780 宽下会把下拉框顶出可视区）；新增「打开输出目录」按钮；列表绑定 Ctrl+A / Delete / 双击定位。
 
 ```diff
 --- upstream:App._build_ui
-+++ main.py:252
++++ main.py:257
+@@ -1,8 +1,8 @@
+         pad = {"padx": 8, "pady": 4}
+-        frm_top = ttk.LabelFrame(self, text="1. 选择 PDF 文件（可多选 / 添加整个文件夹）")
++        frm_top = ttk.LabelFrame(self, text="1. 选择文件（PDF / MOBI / EPUB，可多选 / 添加整个文件夹）")
+         frm_top.pack(fill="both", expand=True, **pad)
+         btns = ttk.Frame(frm_top)
+         btns.pack(fill="x", padx=8, pady=4)
+-        ttk.Button(btns, text="添加 PDF…", command=self.add_files).pack(side="left")
++        ttk.Button(btns, text="添加文件…", command=self.add_files).pack(side="left")
+         ttk.Button(btns, text="添加文件夹…", command=self.add_folder).pack(side="left", padx=6)
+         ttk.Checkbutton(btns, text="含子文件夹", variable=self.recursive).pack(side="left", padx=4)
 @@ -18,4 +18,8 @@
          self.tree.column("status", width=120)
          self.tree.pack(fill="both", expand=True, padx=8, pady=4)
@@ -287,13 +313,13 @@
          self.progress.pack(side="left", fill="x", expand=True, padx=8)
 ```
 
-### `App._on_one_done` → `main.py:556`
+### `App._on_one_done` → `main.py:565`
 
 多一行标题进度 `完成数/总数`。
 
 ```diff
 --- upstream:App._on_one_done
-+++ main.py:556
++++ main.py:565
 @@ -7,4 +7,5 @@
          self._done_count += 1
          self.progress.configure(value=self._done_count)
@@ -302,24 +328,31 @@
          for f in self.files:
 ```
 
-### `App.start` → `main.py:572`
+### `App.start` → `main.py:581`
 
 新增输出重名预检（`batch.find_output_collisions`）；worker 不再调 `self.after`，改投队列；末尾启动 `_pump()`。
 
 ```diff
 --- upstream:App.start
-+++ main.py:572
++++ main.py:581
+@@ -3,5 +3,5 @@
+         todo = [f[0] for f in self.files if f[1] != "完成"]
+         if not todo:
+-            messagebox.showinfo("提示", "没有待转换的 PDF（已完成的不会重复转换）")
++            messagebox.showinfo("提示", "没有待转换的文件（已完成的不会重复转换）")
+             return
+         out_dir = self.out_dir.get().strip()
 @@ -12,4 +12,15 @@
              messagebox.showwarning("提示", "输出目录不存在")
              return
 +        # 同名不同目录的 PDF 会落到同一个 <卷名>.cbz，并行时互相覆盖 —— 先问一声
 +        collisions = find_output_collisions(todo)
 +        if collisions:
-+            preview = "\n".join(f"{name}  ← {len(ps)} 个 PDF" for name, ps in collisions[:5])
++            preview = "\n".join(f"{name}  ← {len(ps)} 个文件" for name, ps in collisions[:5])
 +            more = f"\n…另有 {len(collisions) - 5} 组" if len(collisions) > 5 else ""
 +            if not messagebox.askyesno(
 +                    "输出重名",
-+                    f"有 {len(collisions)} 组 PDF 会写到同一个 CBZ（同名但不在同一目录）：\n"
++                    f"有 {len(collisions)} 组文件会写到同一个 CBZ（同名但不在同一目录）：\n"
 +                    f"{preview}{more}\n\n"
 +                    "转换时它们会互相覆盖，最终只留最后完成的那个。要继续吗？"):
 +                return
@@ -334,8 +367,8 @@
 +        # 单文件 + 多核：任务粒度是「一个文件一个进程」，不切段就只有 1 个核在跑。
 +        # 页数够多才值得切（切段要多一次合并，小文件不划算）。
 +        split = None
-+        if len(todo) == 1 and n_workers > 1:
-+            pages = count_pages(todo[0])
++        if len(todo) == 1 and n_workers > 1 and probe.can_split(todo[0]):
++            pages = probe.image_count(todo[0])
 +            vol = os.path.splitext(os.path.basename(todo[0]))[0]
 +            if pages >= _SPLIT_MIN_PAGES and (ove or not os.path.exists(os.path.join(out_dir, vol + ".cbz"))):
 +                split = (todo[0], pages, vol)
@@ -358,7 +391,7 @@
 +                      for s in range(0, pages, step)]
 +        else:
 +            # 任务键用文件路径（唯一），而非序号 —— 序号在过滤后会错位。
-+            params = [ConvertJob(pdf_path=p, out_dir=out_dir, keep_images=keep,
++            params = [ConvertJob(src_path=p, out_dir=out_dir, keep_images=keep,
 +                                       overwrite=ove, progress=self._progress_q) for p in todo]
          self.running = True
          self._done_count = 0
@@ -382,7 +415,7 @@
 +        # 图片编码探测：只读 xref 不解码，约 0.3 ms/页。文件多时只探前若干个，
 +        # 免得转换还没开始就先卡住界面。
 +        for p in todo[:_PROBE_LIMIT]:
-+            self.log_line(probe_summary(p))
++            self.log_line(probe.summary(p))
 +        if len(todo) > _PROBE_LIMIT:
 +            self.log_line(f"  （文件较多，编码探测只覆盖前 {_PROBE_LIMIT} 个）")
 +        if split:
@@ -455,13 +488,13 @@
 +        self._pump()
 ```
 
-### `App._finish` → `main.py:768`
+### `App._finish` → `main.py:777`
 
 结束后把标题复位。
 
 ```diff
 --- upstream:App._finish
-+++ main.py:768
++++ main.py:777
 @@ -5,2 +5,10 @@
          self.btn_start.config(state="normal")
          self.btn_cancel.config(state="disabled")
@@ -475,11 +508,79 @@
 +            self._manager = None
 ```
 
-### `App.log_line` → `main.py:423`
+### `scan_pdfs` → `batch.py:44`
+
+改名为 `scan_inputs`，扩展名从 `.pdf` 扩成 `SOURCE_EXTS`（PDF + MOBI 家族），递归与非递归两段结构不变。
+
+```diff
+--- upstream:scan_pdfs
++++ batch.py:44
+@@ -3,9 +3,9 @@
+         for root, _, files in os.walk(folder):
+             for f in files:
+-                if f.lower().endswith(".pdf"):
++                if f.lower().endswith(SOURCE_EXTS):
+                     result.append(os.path.join(root, f))
+     else:
+         for entry in os.scandir(folder):
+-            if entry.is_file() and entry.name.lower().endswith(".pdf"):
++            if entry.is_file() and entry.name.lower().endswith(SOURCE_EXTS):
+                 result.append(entry.path)
+     return sorted(result)
+```
+
+### `App._add_paths` → `main.py:361`
+
+```diff
+--- upstream:App._add_paths
++++ main.py:361
+@@ -8,3 +8,3 @@
+         if added and not self.out_dir.get() and paths:
+             self.out_dir.set(os.path.dirname(paths[0]))
+-        self.log_line(f"已添加 {added} 个 PDF（累计 {len(self.files)} 个）")
++        self.log_line(f"已添加 {added} 个文件（累计 {len(self.files)} 个）")
+```
+
+### `App.add_files` → `main.py:341`
+
+```diff
+--- upstream:App.add_files
++++ main.py:341
+@@ -1,4 +1,8 @@
+         paths = filedialog.askopenfilenames(
+-            title="选择 PDF",
+-            filetypes=[("PDF 文件", "*.pdf"), ("所有文件", "*.*")])
++            title="选择文件",
++            filetypes=[("PDF 与电子书", "*.pdf *.mobi *.azw *.azw3 *.prc *.epub"),
++                       ("PDF 文件", "*.pdf"),
++                       ("MOBI / AZW 电子书", "*.mobi *.azw *.azw3 *.prc"),
++                       ("EPUB", "*.epub"),
++                       ("所有文件", "*.*")])
+         self._add_paths(list(paths))
+```
+
+### `App.add_folder` → `main.py:351`
+
+```diff
+--- upstream:App.add_folder
++++ main.py:351
+@@ -2,7 +2,7 @@
+         if not d:
+             return
+-        found = scan_pdfs(d, self.recursive.get())
++        found = scan_inputs(d, self.recursive.get())
+         if not found:
+-            messagebox.showinfo("提示", "该文件夹下没有找到 PDF 文件")
++            messagebox.showinfo("提示", "该文件夹下没有找到 PDF / MOBI / EPUB 文件")
+             return
+         self._add_paths(found)
+```
+
+### `App.log_line` → `main.py:432`
 
 ```diff
 --- upstream:App.log_line
-+++ main.py:423
++++ main.py:432
 @@ -5,4 +5,5 @@
          if n > _LOG_MAX_LINES:
              self.log.delete("1.0", f"{n - _LOG_MAX_LINES}.0")
@@ -488,44 +589,46 @@
          self.log.configure(state="disabled")
 ```
 
-## 三、新增（28 个）
+## 三、新增（27 个）
 
 | 函数/方法 | 位置 | 作用 |
 |---|---|---|
-| `App._drain_progress` | main.py:482 | （见代码） |
-| `App._on_range_done` | main.py:545 | （见代码） |
-| `App._pump` | main.py:502 | 主线程每 80ms 排空事件队列。Tk 非线程安全，工作线程只投数据，界面读写全回主线程。 |
-| `App._render_progress` | main.py:453 | （见代码） |
-| `App._reveal_selected` | main.py:406 | 双击行在资源管理器里定位该文件（explorer /select,）。 |
-| `App._select_all` | main.py:402 | Ctrl+A 全选列表。 |
-| `App.open_out_dir` | main.py:389 | 「打开输出目录」按钮，os.startfile。 |
+| `App._drain_progress` | main.py:491 | （见代码） |
+| `App._on_range_done` | main.py:554 | （见代码） |
+| `App._pump` | main.py:511 | 主线程每 80ms 排空事件队列。Tk 非线程安全，工作线程只投数据，界面读写全回主线程。 |
+| `App._render_progress` | main.py:462 | （见代码） |
+| `App._reveal_selected` | main.py:415 | 双击行在资源管理器里定位该文件（explorer /select,）。 |
+| `App._select_all` | main.py:411 | Ctrl+A 全选列表。 |
+| `App.open_out_dir` | main.py:398 | 「打开输出目录」按钮，os.startfile。 |
 | `_add_image` | archive.py:78 | （见代码） |
-| `_default_workers` | main.py:38 | 并行度默认值：max(1, cpu_count()//2) 落进 1/2/4/6/8 档位。本机 12 逻辑核 → 6。 |
-| `_install_images` | batch.py:174 | （见代码） |
-| `_throttled_page_cb` | batch.py:56 | （见代码） |
+| `_default_workers` | main.py:43 | 并行度默认值：max(1, cpu_count()//2) 落进 1/2/4/6/8 档位。本机 12 逻辑核 → 6。 |
+| `_install_images` | batch.py:147 | （见代码） |
+| `_throttled_page_cb` | batch.py:28 | （见代码） |
 | `build_cbz` | archive.py:86 | 从 convert_pdf_to_cbz 里搬出来的打包段：写 .part → 逐张选压缩方式 → 原子换名。返回图片张数，0 张抛 NoImagesError。 |
-| `convert_range` | batch.py:211 | （见代码） |
-| `count_pages` | batch.py:202 | （见代码） |
+| `convert_range` | batch.py:175 | （见代码） |
 | `execute_renames` | rename.py:89 | 从 RenameDialog._do_rename 搬出的执行段：先全改临时名再改目标名，单文件失败回滚。返回 (成功数, 错误列表)。 |
-| `find_output_collisions` | batch.py:87 | 按输出名（小写归一）给待转 PDF 分组，返回重名组。同名不同目录的 PDF 会写到同一个 CBZ，后完成的覆盖前面的。 |
+| `find_output_collisions` | batch.py:60 | 按输出名（小写归一）给待转 PDF 分组，返回重名组。同名不同目录的 PDF 会写到同一个 CBZ，后完成的覆盖前面的。 |
 | `images_dir_name` | archive.py:41 | 把 `<卷名>_images` 的命名收成一处（原来在 convert 里拼字符串）。 |
 | `is_part_file` | archive.py:55 | 识别带 pid 的 .part，供启动清理使用。 |
-| `iter_unique_images` | extractor.py:47 | 从 convert_pdf_to_cbz 里搬出来的提取循环，改成生成器，逐张 yield (ext, bytes)，峰值内存仍是一张图。 |
+| `iter_pdf_images` | pdf_images.py:52 | 从 extractor.py 的 `_iter_pdf_images` 搬来并转公开（分派层要调它），xref + MD5 双层去重不变。 |
+| `iter_unique_images` | extractor.py:19 | 从 convert_pdf_to_cbz 里搬出来的提取循环，改成生成器，逐张 yield (ext, bytes)，峰值内存仍是一张图。现在只剩分派：PDF 走 `pdf_images.iter_pdf_images`，MOBI 家族走 `mobi.iter_mobi_images`。 |
 | `merge_parts` | archive.py:130 | （见代码） |
-| `merge_ranges` | batch.py:237 | （见代码） |
+| `merge_ranges` | batch.py:201 | （见代码） |
 | `part_path` | archive.py:46 | 临时文件名改为 `<卷>.cbz.<pid>.part`。原先固定 `<卷>.cbz.part`，同名任务并发时共用同一文件，撞 WinError 32 双方全败。 |
-| `probe_pdf` | extractor.py:21 | （见代码） |
-| `probe_summary` | batch.py:38 | （见代码） |
+| `probe_pdf` | pdf_images.py:23 | 从 extractor.py 搬到 pdf_images.py，逻辑未改：只读 xref 扫 Filter 分布，不解码像素。 |
 | `replace_with_retry` | archive.py:61 | os.replace 遇 PermissionError 退避重试 6 次。修 WinError 5/32：两个进程同时换同一个目标名、或杀软/索引器短暂占用刚写好的文件。 |
-| `run_job` | batch.py:227 | （见代码） |
-| `run_selftest` | main.py:785 | （见代码） |
+| `run_job` | batch.py:191 | （见代码） |
+| `run_selftest` | main.py:794 | （见代码） |
 | `write_part` | archive.py:114 | （见代码） |
 
 ## 四、没有删除任何上游逻辑
 
-上游每个函数都在新代码里有对应物：26 个原样搬走，10 个改了内部实现，没有丢弃任何一个。
+上游每个函数都在新代码里有对应物：21 个原样搬走，15 个改了内部实现，没有丢弃任何一个。
 `convert_pdf_to_cbz` 与 `_do_rename` 里被抽走的两段，分别落在 `archive.build_cbz` +
 `extractor.iter_unique_images` 与 `rename.execute_renames`，逐行搬，没有重写。
+
+MOBI / AZW / AZW3 与 EPUB 支持、以及源文件体检，分别是新增模块 `mobi.py` / `epub.py` /
+`probe.py`，不属于上游对照范围——上游只有 PDF 路径。
 
 ## 五、怎么自己验
 
