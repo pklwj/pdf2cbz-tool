@@ -3,6 +3,10 @@
 把图片型（扫描）PDF 一键转成 CBZ 漫画包，Kindle / Kobo / Calibre / 各类漫画阅读器可直接打开。
 带 tkinter 图形界面，可打包成免安装的单文件 exe。
 
+**免安装版**：[下载 PDF2CBZ.exe](https://github.com/pklwj/pdf2cbz-tool/releases/latest/download/PDF2CBZ.exe)
+（Windows x64，约 48 MB）。未做代码签名，首次运行可能被 SmartScreen 拦，点「更多信息 → 仍要运行」；
+onefile 每次启动都要解包，慢 2~3 秒属正常。
+
 ## 特性
 
 - **无损、保原格式**：`page.get_images()` + `doc.extract_image()` 直接取 PDF 内嵌图片的原始编码字节，不重编码、不重采样
