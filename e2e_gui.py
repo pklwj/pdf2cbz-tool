@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import sys
 import tempfile
+import time
 
 PROJ = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJ)
@@ -16,17 +17,19 @@ import pymupdf
 import main
 
 
-def make_pdf(path, color, pages=2):
-    px = pymupdf.Pixmap(pymupdf.csRGB, 60, 60, bytes(color) * (60 * 60), 0)
+def make_pdf(path, color, pages=2, size=(60, 60), noise=False):
+    w, h = size
     doc = pymupdf.open()
     for _ in range(pages):
-        page = doc.new_page(width=300, height=300)
-        page.insert_image(pymupdf.Rect(10, 10, 200, 200), stream=px.tobytes("png"))
+        data = os.urandom(w * h * 3) if noise else bytes(color) * (w * h)
+        px = pymupdf.Pixmap(pymupdf.csRGB, w, h, data, 0)
+        page = doc.new_page(width=312, height=440)
+        page.insert_image(pymupdf.Rect(0, 0, 312, 440), stream=px.tobytes("png"))
     doc.save(path)
     doc.close()
 
 
-def prepare(names, pages=2):
+def prepare(names, pages=2, size=(60, 60), noise=False):
     """建输入 PDF + 输出目录，返回 (app, outdir, pdfs)。"""
     tmp = tempfile.mkdtemp(prefix="gui_e2e_")
     indir = os.path.join(tmp, "in")
@@ -36,7 +39,7 @@ def prepare(names, pages=2):
     pdfs = []
     for i, n in enumerate(names):
         p = os.path.join(indir, n + ".pdf")
-        make_pdf(p, (40 + i * 50, 90, 160), pages)
+        make_pdf(p, (40 + i * 50, 90, 160), pages, size, noise)
         pdfs.append(p)
     app = main.App()
     app.files = [[p, ""] for p in pdfs]
@@ -73,6 +76,7 @@ def collect(app, outdir):
         "workers": app.workers.get(),
         "queued": app._events.qsize(),
         "selected": len(app.tree.selection()),
+        "children": len(multiprocessing.active_children()),
     }
 
 
@@ -116,21 +120,28 @@ def scenario_split():
 
 
 def scenario_cancel():
-    """开跑后立刻点「停止」，确认能收尾、按钮能复位。"""
-    app, outdir, _ = prepare(["C 01", "C 02", "C 03", "C 04"], pages=4)
+    """开跑后立刻点「停止」：必须是真中止，不是卡在「正在中止…」。"""
+    # 用真扫描件量级（A4 300dpi、噪声内容）保证跑得够久，取消才检验得到
+    app, outdir, _ = prepare(["C 01"], pages=10, size=(1240, 1754), noise=True)
     main.messagebox.askyesno = lambda *a, **k: True   # 跳过确认框
     out = {}
-    app.after(0, app.start)
-    app.after(20, app.cancel)
+    state = {}
+
+    def do_cancel():
+        state["t"] = time.time()
+        app.cancel()
 
     def poll():
         if app.running:
-            app.after(50, poll)
+            app.after(30, poll)
         else:
             out.update(collect(app, outdir))
+            out["stop_latency"] = time.time() - state.get("t", time.time())
             app.destroy()
 
-    app.after(60, poll)
+    app.after(0, app.start)
+    app.after(1500, do_cancel)
+    app.after(200, poll)
     app.after(60000, lambda: app.destroy() if app.running else None)
     app.mainloop()
     return out
@@ -164,12 +175,16 @@ def main_():
     })
 
     k = scenario_cancel()
-    ok &= report("中途停止", {
+    ok &= report("中途停止（真慢文件）", {
         "running 复位": k["running"] is False,
+        "1 秒内收尾": k.get("stop_latency", 99) < 2.0,
+        "子进程已退出": k["children"] == 0,
         "按钮复位": k["buttons"] == ("normal", "disabled"),
         "标题复位": k["title"] == main._APP_TITLE,
         "事件队列已排空": k["queued"] == 0,
-        "日志有收尾": ("已停止" in k["log"]) or ("运行结束" in k["log"]),
+        "日志有已停止": "已停止" in k["log"],
+        "没产出半截 CBZ": not any(x.endswith(".cbz") for x in k["files"]),
+        "无 .part 残留": not any(x.endswith(".part") for x in k["files"]),
         "无异常栈": "Traceback" not in k["log"],
     })
 

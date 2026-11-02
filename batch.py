@@ -6,7 +6,6 @@ PyMuPDF 底层 MuPDF 不保证线程安全，所以并行只能走多进程（�
 """
 import os
 import shutil
-import tempfile
 import time
 import traceback
 from collections import namedtuple
@@ -14,6 +13,7 @@ from collections import namedtuple
 import pymupdf
 
 import archive
+import extractor
 
 # 转换任务参数：用具名元组替代裸元组，避免位置传参错位，且可被 pickle。
 # progress 是 Manager().Queue() 的代理，worker 往里丢 (标签, 已处理页, 总页数)；
@@ -22,6 +22,35 @@ ConvertJob = namedtuple("ConvertJob", "pdf_path out_dir keep_images overwrite pr
                         defaults=(None,))
 # 页段任务：单文件吃多核用。一整册按页切段，各段写自己的临时 zip，最后合并。
 RangeJob = namedtuple("RangeJob", "pdf_path part start end")
+
+# 编码 → (处理方式, 快慢)。判断依据是 PyMuPDF 能不能直接给出原始字节：
+# DCT/JPX/JBIG2/CCITT 都是成品压缩流，取出来就是合法图片；Flate 与裸位图要重新编码。
+_FILTER_HINT = {
+    "DCTDecode": ("JPEG 字节直拷", "快"),
+    "JPXDecode": ("JPEG2000 字节直拷", "快"),
+    "JBIG2Decode": ("JBIG2 字节直拷", "快"),
+    "CCITTFaxDecode": ("CCITT 字节直拷", "快"),
+    "FlateDecode": ("解压后重编码 PNG", "慢"),
+    "未压缩": ("裸位图，需编码 PNG", "慢"),
+}
+
+
+def probe_summary(pdf_path):
+    """一行日志用的摘要：页数 / 图片数 / 编码分布 / 快慢判断。"""
+    name = os.path.basename(pdf_path)
+    try:
+        pages, total, dist = extractor.probe_pdf(pdf_path)
+    except Exception as e:
+        return f"  {name}：读取失败（{e}），转换大概率也会失败"
+    head = f"  {name}：{pages} 页，{total} 张图"
+    if not total:
+        return head + " → 未检测到图片，转换会失败（只支持图片型 PDF）"
+    top = dist.most_common(3)
+    shown = " / ".join(f"{k} {v}" for k, v in top)
+    if len(dist) > 3:
+        shown += f" / 另 {len(dist) - 3} 种"
+    action, speed = _FILTER_HINT.get(top[0][0], ("未知编码", "未知"))
+    return f"{head} · {shown} → 多数 {top[0][0]}，{action}，{speed}"
 
 
 def _throttled_page_cb(q, label, interval=0.4):
@@ -113,7 +142,13 @@ def convert_pdf_to_cbz(job):
     if os.path.exists(cbz) and not overwrite:
         return pdf_path, False, f"跳过：{vol}.cbz 已存在（勾选“覆盖”可重做）"
 
-    work = tempfile.mkdtemp(prefix=f"pdf2cbz_{os.getpid()}_") if keep_images else None
+    work = None
+    if keep_images:
+        # 放输出目录而不是系统 temp：①同盘移动免拷贝；②子进程被终止时也落在
+        # 启动清理能扫到的 .tmp_* 规则里，不会在 %TEMP% 里永久残留
+        work = os.path.join(out_dir, f".tmp_work_{os.getpid()}")
+        shutil.rmtree(work, ignore_errors=True)
+        os.makedirs(work, exist_ok=True)
     progress = getattr(job, "progress", None)
     on_page = _throttled_page_cb(progress, vol) if progress is not None else None
     try:
@@ -203,7 +238,11 @@ def merge_ranges(pdf_path, out_dir, vol, parts, keep_images):
     """合并页段并收尾，返回与 convert_pdf_to_cbz 同形的 (路径, 是否成功, 消息)。"""
     base = os.path.basename(pdf_path)
     cbz = os.path.join(out_dir, vol + ".cbz")
-    work = tempfile.mkdtemp(prefix=f"pdf2cbz_{os.getpid()}_") if keep_images else None
+    work = None
+    if keep_images:
+        work = os.path.join(out_dir, f".tmp_work_{os.getpid()}")
+        shutil.rmtree(work, ignore_errors=True)
+        os.makedirs(work, exist_ok=True)
     try:
         saved = archive.merge_parts(parts, cbz, image_sink=work)
         size_mb = os.path.getsize(cbz) / 1024 / 1024

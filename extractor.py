@@ -9,9 +9,39 @@ doc.extract_image() 直接返回 PDF 内嵌图片的原始编码字节 —— �
   2) 内容级：不同 xref 但字节完全相同的图（有些 PDF 会重复嵌入），MD5 兜住。
 """
 import hashlib
+from collections import Counter
 from typing import Iterator, Tuple
 
 import pymupdf
+
+# Filter 名里没有 `/Filter` 键的裸位图，统一记成这个名字
+UNCOMPRESSED = "未压缩"
+
+
+def probe_pdf(pdf_path: str):
+    """只读 xref 扫图片编码，不解码任何一个像素。
+
+    返回 (页数, 唯一图片数, Counter{编码名: 张数})。
+    Filter 可能是数组（如 `/Filter [/FlateDecode]`），逐个 token 计入。
+    实测 200 页 / 883 MB 的 PDF 只要 53 ms，可以放在转换前同步跑。
+    """
+    dist = Counter()
+    seen = set()
+    with pymupdf.open(pdf_path) as doc:
+        pages = doc.page_count
+        for page in doc:
+            for img in page.get_images(full=True):
+                xref = img[0]
+                if xref in seen:
+                    continue
+                seen.add(xref)
+                kind, val = doc.xref_get_key(xref, "Filter")
+                if kind == "null":
+                    dist[UNCOMPRESSED] += 1
+                else:
+                    for tok in val.strip("[]").split():
+                        dist[tok.lstrip("/")] += 1
+    return pages, len(seen), dist
 
 
 def iter_unique_images(pdf_path: str, start: int = 0, end: int = None,

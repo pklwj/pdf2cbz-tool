@@ -31,6 +31,8 @@ _APP_TITLE = "PDF 转 CBZ 漫画打包工具"
 _WORKER_CHOICES = ("1", "2", "4", "6", "8")
 # 单文件低于这个页数就不切段：分段要付出一次合并开销（读+写一份完整副本）
 _SPLIT_MIN_PAGES = 40
+# 转换前最多探测多少个文件的图片编码（每个约 0.3 ms/页）
+_PROBE_LIMIT = 10
 
 
 def _default_workers():
@@ -654,6 +656,12 @@ class App(tk.Tk):
         self.log_line(f"===== 运行开始 | 输出目录：{out_dir} =====")
         self.log_line(f"== 开始转换 {len(todo)} 个文件（并行 {n_workers}），"
                       f"保留中间图片：{'是' if keep else '否'}，覆盖：{'是' if ove else '否'} ==")
+        # 图片编码探测：只读 xref 不解码，约 0.3 ms/页。文件多时只探前若干个，
+        # 免得转换还没开始就先卡住界面。
+        for p in todo[:_PROBE_LIMIT]:
+            self.log_line(batch.probe_summary(p))
+        if len(todo) > _PROBE_LIMIT:
+            self.log_line(f"  （文件较多，编码探测只覆盖前 {_PROBE_LIMIT} 个）")
         if split:
             self.log_line(f"== 单文件按页切 {len(params)} 段并行（{pages} 页），完成后合并 ==")
 
@@ -671,11 +679,21 @@ class App(tk.Tk):
                         pool.join()
                         return
                     self._pool = pool
-                for res in pool.imap_unordered(batch.run_job, params):
-                    with self._state_lock:
-                        cancelled = self._cancelled
-                    if cancelled:
+                it = pool.imap_unordered(batch.run_job, params)
+                finished = False
+                while True:
+                    try:
+                        res = it.next(timeout=0.3)
+                    except StopIteration:
+                        finished = True
                         break
+                    except multiprocessing.TimeoutError:
+                        # 必须轮询：terminate() 之后迭代器不会再吐结果，
+                        # 阻塞式 for 循环会永远等下去（旧版就卡死在这里）
+                        with self._state_lock:
+                            if self._cancelled:
+                                break
+                        continue
                     if res[0] == "range":
                         _, part, ok, msg, n, label, elapsed = res
                         if ok:
@@ -686,16 +704,14 @@ class App(tk.Tk):
                     else:
                         _, key, ok, msg = res
                         self._events.put(("done", (key, ok, msg)))
-                else:
-                    # 循环正常跑完（未被 break）才合并；被中止则交给下次启动清理 .part
-                    if split:
-                        pdf, _pages, vol = split
-                        if range_failed:
-                            self._events.put(("done", (pdf, False, "失败：有页段未完成，已跳过合并")))
-                        else:
-                            self._events.put(("log", f"== {len(done_parts)} 个页段完成，合并中… =="))
-                            self._events.put(("done", batch.merge_ranges(
-                                pdf, out_dir, vol, sorted(done_parts), keep)))
+                if finished and split:
+                    pdf, _pages, vol = split
+                    if range_failed:
+                        self._events.put(("done", (pdf, False, "失败：有页段未完成，已跳过合并")))
+                    else:
+                        self._events.put(("log", f"== {len(done_parts)} 个页段完成，合并中… =="))
+                        self._events.put(("done", batch.merge_ranges(
+                            pdf, out_dir, vol, sorted(done_parts), keep)))
             except Exception:
                 self._events.put(("log", "异常：\n" + traceback.format_exc()))
             finally:
@@ -708,6 +724,12 @@ class App(tk.Tk):
                 with self._state_lock:
                     self._pool = None
                     cancelled = self._cancelled
+                if cancelled:
+                    # 中止时立刻清掉 .part / .tmp_*，别留到下次启动才清
+                    try:
+                        batch.cleanup_stale_tmp(out_dir)
+                    except Exception:
+                        pass
                 self._events.put(("end", cancelled))
 
         threading.Thread(target=worker, daemon=True).start()

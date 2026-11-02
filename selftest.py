@@ -142,6 +142,15 @@ def run():
     check("ConvertJob 四参调用仍可用",
           batch.ConvertJob("a", "b", False, False).progress is None)
 
+    # 图片编码探测：3 张唯一图 = 1 JPEG(DCTDecode) + 2 PNG（PyMuPDF 存裸位图，无 Filter）
+    summary = batch.probe_summary(pdf)
+    check("probe_summary 认出 3 张图", "3 张图" in summary, summary)
+    check("probe_summary 分类正确",
+          "DCTDecode 1" in summary and "未压缩 2" in summary, summary)
+    pages_p, total_p, dist_p = extractor.probe_pdf(pdf)
+    check("probe_pdf 页数/张数", (pages_p, total_p) == (3, 3), (pages_p, total_p))
+    check("probe_pdf 分布", dict(dist_p) == {"DCTDecode": 1, "未压缩": 2}, dict(dist_p))
+
     # --- 3. 与上游单文件等价（PDF2CBZ_ORIG 指向上游 pdf2cbz_gui.py） ---
     orig = load_upstream()
     if orig is None:
@@ -191,6 +200,8 @@ def run():
     check("无图 PDF 报错且不留 .part",
           (not okv) and "未提取到任何图片" in msgv and os.listdir(dv) == [],
           (msgv, os.listdir(dv)))
+    check("空图 PDF 的摘要提前给提示",
+          "未检测到图片" in batch.probe_summary(vec), batch.probe_summary(vec))
 
     # --- 7. 重命名逻辑 ---
     cases = {"I's v01.cbz": 1, "Vol.12.cbz": 12, "Vol 03 x.cbz": 3, "第7卷.cbz": 7,

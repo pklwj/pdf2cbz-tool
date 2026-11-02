@@ -11,7 +11,7 @@
 | 上游函数/方法 | 36 |
 | 逐字未改（只换了所在模块） | 25 |
 | 有实质改动 | 11 |
-| 新增函数/方法 | 26 |
+| 新增函数/方法 | 28 |
 
 ## 一、逐字未改（只换了文件）
 
@@ -34,13 +34,13 @@
      return stem or "untitled"
 ```
 
-### `_cleanup_stale_tmp` → `batch.py:78`
+### `_cleanup_stale_tmp` → `batch.py:107`
 
 `.part` 后缀判断改调 `archive.is_part_file()`——临时名里现在夹了 pid，原来的 `.cbz.part` 字面后缀匹配不上了。
 
 ```diff
 --- upstream:_cleanup_stale_tmp
-+++ batch.py:78
++++ batch.py:107
 @@ -3,5 +3,5 @@
              if name.startswith(".tmp_") or (
                      name.startswith(".__rn_") and name.endswith(".tmp")) or (
@@ -50,16 +50,24 @@
                  try:
 ```
 
-### `convert_pdf_to_cbz` → `batch.py:98`
+### `convert_pdf_to_cbz` → `batch.py:127`
 
 提取循环搬去 `extractor.iter_unique_images()`，打包搬去 `archive.build_cbz()`。keep_images 搬家、原子换名、失败兜底三段原样保留，只把 `os.replace` 换成带重试的版本。
 
 ```diff
 --- upstream:convert_pdf_to_cbz
-+++ batch.py:98
-@@ -9,70 +9,16 @@
++++ batch.py:127
+@@ -8,71 +8,23 @@
+     if os.path.exists(cbz) and not overwrite:
          return pdf_path, False, f"跳过：{vol}.cbz 已存在（勾选“覆盖”可重做）"
-     work = tempfile.mkdtemp(prefix=f"pdf2cbz_{os.getpid()}_") if keep_images else None
+-    work = tempfile.mkdtemp(prefix=f"pdf2cbz_{os.getpid()}_") if keep_images else None
++    work = None
++    if keep_images:
++        # 放输出目录而不是系统 temp：①同盘移动免拷贝；②子进程被终止时也落在
++        # 启动清理能扫到的 .tmp_* 规则里，不会在 %TEMP% 里永久残留
++        work = os.path.join(out_dir, f".tmp_work_{os.getpid()}")
++        shutil.rmtree(work, ignore_errors=True)
++        os.makedirs(work, exist_ok=True)
 +    progress = getattr(job, "progress", None)
 +    on_page = _throttled_page_cb(progress, vol) if progress is not None else None
      try:
@@ -137,13 +145,13 @@
      except Exception as e:
 ```
 
-### `RenameDialog._refresh` → `main.py:105`
+### `RenameDialog._refresh` → `main.py:107`
 
 底部文案改走 `_update_lbl()`。原来是两处各写一遍同样的 if，加一个「跳过」按钮就得改两处。
 
 ```diff
 --- upstream:RenameDialog._refresh
-+++ main.py:105
++++ main.py:107
 @@ -22,6 +22,3 @@
              else:
                  self.tree.insert("", "end", values=("执行", old, new))
@@ -154,13 +162,13 @@
 +        self._update_lbl()
 ```
 
-### `RenameDialog._do_rename` → `main.py:173`
+### `RenameDialog._do_rename` → `main.py:175`
 
 两步改名 + 单文件回滚那一整段搬去 `rename.execute_renames()`，这里只剩参数校验、确认框、汇总消息。行为不变，差别是那段代码终于能被单测碰到。
 
 ```diff
 --- upstream:RenameDialog._do_rename
-+++ main.py:173
++++ main.py:175
 @@ -4,5 +4,5 @@
              return
          plan = plan_renames(folder, self.prefix_var.get().strip(),
@@ -201,13 +209,13 @@
          if self.skipped:
 ```
 
-### `App.__init__` → `main.py:219`
+### `App.__init__` → `main.py:221`
 
 加事件队列 `_events` 与 `_run_total`；并行度默认值从写死的 `"6"` 改为 `_default_workers()`（按 cpu_count()//2 落档位）。
 
 ```diff
 --- upstream:App.__init__
-+++ main.py:219
++++ main.py:221
 @@ -1,12 +1,12 @@
          super().__init__()
 -        self.title("PDF 转 CBZ 漫画打包工具")
@@ -238,13 +246,13 @@
          self._state_lock = threading.Lock()
 ```
 
-### `App._build_ui` → `main.py:250`
+### `App._build_ui` → `main.py:252`
 
 标题常量化；「并行任务数」从复选框行挪到输出目录行（原位置在 780 宽下会把下拉框顶出可视区）；新增「打开输出目录」按钮；列表绑定 Ctrl+A / Delete / 双击定位。
 
 ```diff
 --- upstream:App._build_ui
-+++ main.py:250
++++ main.py:252
 @@ -18,4 +18,8 @@
          self.tree.column("status", width=120)
          self.tree.pack(fill="both", expand=True, padx=8, pady=4)
@@ -279,13 +287,13 @@
          self.progress.pack(side="left", fill="x", expand=True, padx=8)
 ```
 
-### `App._on_one_done` → `main.py:554`
+### `App._on_one_done` → `main.py:556`
 
 多一行标题进度 `完成数/总数`。
 
 ```diff
 --- upstream:App._on_one_done
-+++ main.py:554
++++ main.py:556
 @@ -7,4 +7,5 @@
          self._done_count += 1
          self.progress.configure(value=self._done_count)
@@ -294,13 +302,13 @@
          for f in self.files:
 ```
 
-### `App.start` → `main.py:570`
+### `App.start` → `main.py:572`
 
 新增输出重名预检（`batch.find_output_collisions`）；worker 不再调 `self.after`，改投队列；末尾启动 `_pump()`。
 
 ```diff
 --- upstream:App.start
-+++ main.py:570
++++ main.py:572
 @@ -12,4 +12,15 @@
              messagebox.showwarning("提示", "输出目录不存在")
              return
@@ -368,9 +376,15 @@
 +        self.progress.configure(maximum=self._run_total, value=0)
          self._run_started = time.time()
          self._run_ok = 0
-@@ -36,6 +78,10 @@
+@@ -36,6 +78,16 @@
          self.log_line(f"== 开始转换 {len(todo)} 个文件（并行 {n_workers}），"
                        f"保留中间图片：{'是' if keep else '否'}，覆盖：{'是' if ove else '否'} ==")
++        # 图片编码探测：只读 xref 不解码，约 0.3 ms/页。文件多时只探前若干个，
++        # 免得转换还没开始就先卡住界面。
++        for p in todo[:_PROBE_LIMIT]:
++            self.log_line(probe_summary(p))
++        if len(todo) > _PROBE_LIMIT:
++            self.log_line(f"  （文件较多，编码探测只覆盖前 {_PROBE_LIMIT} 个）")
 +        if split:
 +            self.log_line(f"== 单文件按页切 {len(params)} 段并行（{pages} 页），完成后合并 ==")
          def worker():
@@ -379,16 +393,29 @@
 +            range_failed = False
              try:
                  # maxtasksperchild 限制单进程内存累积，避免大 PDF 长跑内存泄漏
-@@ -48,12 +94,31 @@
+@@ -48,12 +100,39 @@
                          return
                      self._pool = pool
 -                for key, ok, msg in pool.imap_unordered(convert_pdf_to_cbz, params):
-+                for res in pool.imap_unordered(run_job, params):
-                     with self._state_lock:
-                         cancelled = self._cancelled
-                     if cancelled:
+-                    with self._state_lock:
+-                        cancelled = self._cancelled
+-                    if cancelled:
++                it = pool.imap_unordered(run_job, params)
++                finished = False
++                while True:
++                    try:
++                        res = it.next(timeout=0.3)
++                    except StopIteration:
++                        finished = True
                          break
 -                    self.after(0, self._on_one_done, key, ok, msg)
++                    except multiprocessing.TimeoutError:
++                        # 必须轮询：terminate() 之后迭代器不会再吐结果，
++                        # 阻塞式 for 循环会永远等下去（旧版就卡死在这里）
++                        with self._state_lock:
++                            if self._cancelled:
++                                break
++                        continue
 +                    if res[0] == "range":
 +                        _, part, ok, msg, n, label, elapsed = res
 +                        if ok:
@@ -399,38 +426,42 @@
 +                    else:
 +                        _, key, ok, msg = res
 +                        self._events.put(("done", (key, ok, msg)))
-+                else:
-+                    # 循环正常跑完（未被 break）才合并；被中止则交给下次启动清理 .part
-+                    if split:
-+                        pdf, _pages, vol = split
-+                        if range_failed:
-+                            self._events.put(("done", (pdf, False, "失败：有页段未完成，已跳过合并")))
-+                        else:
-+                            self._events.put(("log", f"== {len(done_parts)} 个页段完成，合并中… =="))
-+                            self._events.put(("done", merge_ranges(
-+                                pdf, out_dir, vol, sorted(done_parts), keep)))
++                if finished and split:
++                    pdf, _pages, vol = split
++                    if range_failed:
++                        self._events.put(("done", (pdf, False, "失败：有页段未完成，已跳过合并")))
++                    else:
++                        self._events.put(("log", f"== {len(done_parts)} 个页段完成，合并中… =="))
++                        self._events.put(("done", merge_ranges(
++                            pdf, out_dir, vol, sorted(done_parts), keep)))
              except Exception:
 -                self.after(0, self.log_line, "异常：\n" + traceback.format_exc())
 +                self._events.put(("log", "异常：\n" + traceback.format_exc()))
              finally:
                  if pool is not None:
-@@ -66,5 +131,5 @@
+@@ -66,5 +145,11 @@
                      self._pool = None
                      cancelled = self._cancelled
 -                self.after(0, self._on_run_end, cancelled)
 -                self.after(0, self._finish)
++                if cancelled:
++                    # 中止时立刻清掉 .part / .tmp_*，别留到下次启动才清
++                    try:
++                        cleanup_stale_tmp(out_dir)
++                    except Exception:
++                        pass
 +                self._events.put(("end", cancelled))
          threading.Thread(target=worker, daemon=True).start()
 +        self._pump()
 ```
 
-### `App._finish` → `main.py:746`
+### `App._finish` → `main.py:768`
 
 结束后把标题复位。
 
 ```diff
 --- upstream:App._finish
-+++ main.py:746
++++ main.py:768
 @@ -5,2 +5,10 @@
          self.btn_start.config(state="normal")
          self.btn_cancel.config(state="disabled")
@@ -444,11 +475,11 @@
 +            self._manager = None
 ```
 
-### `App.log_line` → `main.py:421`
+### `App.log_line` → `main.py:423`
 
 ```diff
 --- upstream:App.log_line
-+++ main.py:421
++++ main.py:423
 @@ -5,4 +5,5 @@
          if n > _LOG_MAX_LINES:
              self.log.delete("1.0", f"{n - _LOG_MAX_LINES}.0")
@@ -457,35 +488,37 @@
          self.log.configure(state="disabled")
 ```
 
-## 三、新增（26 个）
+## 三、新增（28 个）
 
 | 函数/方法 | 位置 | 作用 |
 |---|---|---|
-| `App._drain_progress` | main.py:480 | （见代码） |
-| `App._on_range_done` | main.py:543 | （见代码） |
-| `App._pump` | main.py:500 | 主线程每 80ms 排空事件队列。Tk 非线程安全，工作线程只投数据，界面读写全回主线程。 |
-| `App._render_progress` | main.py:451 | （见代码） |
-| `App._reveal_selected` | main.py:404 | 双击行在资源管理器里定位该文件（explorer /select,）。 |
-| `App._select_all` | main.py:400 | Ctrl+A 全选列表。 |
-| `App.open_out_dir` | main.py:387 | 「打开输出目录」按钮，os.startfile。 |
+| `App._drain_progress` | main.py:482 | （见代码） |
+| `App._on_range_done` | main.py:545 | （见代码） |
+| `App._pump` | main.py:502 | 主线程每 80ms 排空事件队列。Tk 非线程安全，工作线程只投数据，界面读写全回主线程。 |
+| `App._render_progress` | main.py:453 | （见代码） |
+| `App._reveal_selected` | main.py:406 | 双击行在资源管理器里定位该文件（explorer /select,）。 |
+| `App._select_all` | main.py:402 | Ctrl+A 全选列表。 |
+| `App.open_out_dir` | main.py:389 | 「打开输出目录」按钮，os.startfile。 |
 | `_add_image` | archive.py:78 | （见代码） |
-| `_default_workers` | main.py:36 | 并行度默认值：max(1, cpu_count()//2) 落进 1/2/4/6/8 档位。本机 12 逻辑核 → 6。 |
-| `_install_images` | batch.py:139 | （见代码） |
-| `_throttled_page_cb` | batch.py:27 | （见代码） |
+| `_default_workers` | main.py:38 | 并行度默认值：max(1, cpu_count()//2) 落进 1/2/4/6/8 档位。本机 12 逻辑核 → 6。 |
+| `_install_images` | batch.py:174 | （见代码） |
+| `_throttled_page_cb` | batch.py:56 | （见代码） |
 | `build_cbz` | archive.py:86 | 从 convert_pdf_to_cbz 里搬出来的打包段：写 .part → 逐张选压缩方式 → 原子换名。返回图片张数，0 张抛 NoImagesError。 |
-| `convert_range` | batch.py:176 | （见代码） |
-| `count_pages` | batch.py:167 | （见代码） |
+| `convert_range` | batch.py:211 | （见代码） |
+| `count_pages` | batch.py:202 | （见代码） |
 | `execute_renames` | rename.py:89 | 从 RenameDialog._do_rename 搬出的执行段：先全改临时名再改目标名，单文件失败回滚。返回 (成功数, 错误列表)。 |
-| `find_output_collisions` | batch.py:58 | 按输出名（小写归一）给待转 PDF 分组，返回重名组。同名不同目录的 PDF 会写到同一个 CBZ，后完成的覆盖前面的。 |
+| `find_output_collisions` | batch.py:87 | 按输出名（小写归一）给待转 PDF 分组，返回重名组。同名不同目录的 PDF 会写到同一个 CBZ，后完成的覆盖前面的。 |
 | `images_dir_name` | archive.py:41 | 把 `<卷名>_images` 的命名收成一处（原来在 convert 里拼字符串）。 |
 | `is_part_file` | archive.py:55 | 识别带 pid 的 .part，供启动清理使用。 |
-| `iter_unique_images` | extractor.py:17 | 从 convert_pdf_to_cbz 里搬出来的提取循环，改成生成器，逐张 yield (ext, bytes)，峰值内存仍是一张图。 |
+| `iter_unique_images` | extractor.py:47 | 从 convert_pdf_to_cbz 里搬出来的提取循环，改成生成器，逐张 yield (ext, bytes)，峰值内存仍是一张图。 |
 | `merge_parts` | archive.py:130 | （见代码） |
-| `merge_ranges` | batch.py:202 | （见代码） |
+| `merge_ranges` | batch.py:237 | （见代码） |
 | `part_path` | archive.py:46 | 临时文件名改为 `<卷>.cbz.<pid>.part`。原先固定 `<卷>.cbz.part`，同名任务并发时共用同一文件，撞 WinError 32 双方全败。 |
+| `probe_pdf` | extractor.py:21 | （见代码） |
+| `probe_summary` | batch.py:38 | （见代码） |
 | `replace_with_retry` | archive.py:61 | os.replace 遇 PermissionError 退避重试 6 次。修 WinError 5/32：两个进程同时换同一个目标名、或杀软/索引器短暂占用刚写好的文件。 |
-| `run_job` | batch.py:192 | （见代码） |
-| `run_selftest` | main.py:763 | （见代码） |
+| `run_job` | batch.py:227 | （见代码） |
+| `run_selftest` | main.py:785 | （见代码） |
 | `write_part` | archive.py:114 | （见代码） |
 
 ## 四、没有删除任何上游逻辑
