@@ -1,0 +1,17 @@
+# 构建产物与缓存
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+
+# 运行时产物
+*.part
+*.cbz
+*_images/
+pdf2cbz.log
+pdf2cbz_selftest.txt
+
+# 本地验证截图
+gui_shot.png
+exe_shot.png
